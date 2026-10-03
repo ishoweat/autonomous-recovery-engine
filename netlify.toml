@@ -1,0 +1,11 @@
+[build]
+  base = "frontend"
+  command = "npm install && npm run build"
+  publish = ".next"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+[build.environment]
+  NEXT_PRIVATE_LOCAL_WEBPACK = "true"
+  NEXT_PUBLIC_API_URL = "https://your-backend-tunnel-url.ngrok.app" # To be replaced by user

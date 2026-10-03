@@ -1,0 +1,109 @@
+# docker-compose.prod.yml
+
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: recovery-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-recovery_engine}
+      POSTGRES_USER: ${POSTGRES_USER:-recovery}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-recovery} -d ${POSTGRES_DB:-recovery_engine}"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - recovery_internal
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: recovery-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-recovery}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-recovery_engine}
+
+      NEBIUS_API_KEY: ${NEBIUS_API_KEY:?NEBIUS_API_KEY must be set}
+      NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:?NEBIUS_BASE_URL must be set}
+      NEBIUS_MODEL: ${NEBIUS_MODEL:-nvidia/Nemotron-3_5-Lightning}
+
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?GITHUB_TOKEN must be set}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?GITHUB_WEBHOOK_SECRET must be set}
+
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - recovery_internal
+      - recovery_public
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    container_name: recovery-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - recovery_public
+
+volumes:
+  postgres_data:
+
+networks:
+  recovery_internal:
+    driver: bridge
+    internal: true
+
+  recovery_public:
+    driver: bridge
