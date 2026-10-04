@@ -1,6 +1,6 @@
-# Antigravity: Autonomous Reliability Engine (ARE)
+# AegisCore : Autonomous Reliability Engine (ARE)
 
-**One-Paragraph Pitch**: Antigravity is a stateful, agentic CI/CD self-healing pipeline. When a build breaks, Antigravity intercepts the webhook, spins up an NVIDIA Nemotron agent via the Nebius Token Factory to triage and isolate the root cause, and uses Tavily to cross-reference known issues. It then writes a patch, tests it in an isolated Docker sandbox, calculates a deterministic risk score to decide if it's safe to auto-merge (ALLOW), hold for human review (APPROVE), or escalate (BLOCK), and opens a pull request—turning your pipeline from a passive alarm into an active, self-healing organism.
+**One-Paragraph Pitch**: AegisCore is a stateful, agentic CI/CD self-healing pipeline. When a build breaks, AegisCore intercepts the webhook, spins up an NVIDIA Nemotron agent via the Nebius Token Factory to triage and isolate the root cause, and uses Tavily to cross-reference known issues. It then writes a patch, tests it in an isolated Docker sandbox, calculates a deterministic risk score to decide if it's safe to auto-merge (ALLOW), hold for human review (APPROVE), or escalate (BLOCK), and opens a pull request—turning your pipeline from a passive alarm into an active, self-healing organism.
 
 **Hackathon Track**: Coding and Agentic Engineering
 
