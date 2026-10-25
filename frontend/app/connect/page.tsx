@@ -40,6 +40,36 @@ export default function ConnectPage() {
   }
  }, [analyzing, currentStep]);
 
+ const autoValidateRepo = async (url: string) => {
+  setRepoUrl(url);
+  if (!url.trim()) return;
+  setLoading(true);
+  setError(null);
+  setRepoDetails(null);
+  try {
+   const valRes = await fetch(`${API_BASE_URL}/api/v1/github/validate-repo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ repository_url: url })
+   });
+   if (valRes.ok) {
+    const data = await valRes.json();
+    setRepoDetails(data);
+    if (typeof window !== "undefined") {
+     localStorage.setItem("connected_repo", JSON.stringify({
+      owner: data.owner || "",
+      repo: data.repo || "",
+      full_name: data.full_name || (data.owner && data.repo ? `${data.owner}/${data.repo}` : ""),
+      default_branch: data.default_branch || "main",
+      repository_url: url
+     }));
+    }
+   }
+  } catch (_e) {}
+  setLoading(false);
+ };
+
  async function handleValidateRepo(e: React.FormEvent) {
   e.preventDefault();
   setLoading(true);
@@ -77,6 +107,9 @@ export default function ConnectPage() {
      repository_url: repoUrl
     }));
    }
+   
+   // Automatically continue to investigate
+   handleInvestigate(true, data);
   } catch (err: any) {
    let msg = err.message || "Failed to validate repository.";
    try {
@@ -89,19 +122,21 @@ export default function ConnectPage() {
   }
  }
 
- async function handleInvestigate(allowManual: boolean | React.MouseEvent = false) {
+ async function handleInvestigate(allowManual: boolean | React.MouseEvent = false, scannedData?: any) {
   const isManual = typeof allowManual === "boolean" ? allowManual : false;
   setAnalyzing(true);
   setCurrentStep(0);
   setError(null);
   setInfoNotice(null);
 
-  if (typeof window !== "undefined" && repoDetails) {
+  const activeRepoDetails = scannedData || repoDetails;
+  
+  if (typeof window !== "undefined" && activeRepoDetails) {
    localStorage.setItem("connected_repo", JSON.stringify({
-    owner: repoDetails.owner || "",
-    repo: repoDetails.repo || "",
-    full_name: repoDetails.full_name || (repoDetails.owner && repoDetails.repo ? `${repoDetails.owner}/${repoDetails.repo}` : ""),
-    default_branch: repoDetails.default_branch || "main",
+    owner: activeRepoDetails.owner || "",
+    repo: activeRepoDetails.repo || "",
+    full_name: activeRepoDetails.full_name || (activeRepoDetails.owner && activeRepoDetails.repo ? `${activeRepoDetails.owner}/${activeRepoDetails.repo}` : ""),
+    default_branch: activeRepoDetails.default_branch || "main",
     repository_url: repoUrl
    }));
   }
@@ -113,9 +148,9 @@ export default function ConnectPage() {
     credentials: "include",
     body: JSON.stringify({
      repository_url: repoUrl,
-     owner: repoDetails?.owner || "",
-     repo: repoDetails?.repo || "",
-     default_branch: repoDetails?.default_branch || "main",
+     owner: activeRepoDetails?.owner || "",
+     repo: activeRepoDetails?.repo || "",
+     default_branch: activeRepoDetails?.default_branch || "main",
      allow_manual: isManual
     })
    });
@@ -161,7 +196,7 @@ export default function ConnectPage() {
        <GitHubSessionWidget
         className="mb-space-lg"
         currentRepoUrl={repoUrl}
-        onSelectRepo={(url) => setRepoUrl(url)}
+        onSelectRepo={(url) => autoValidateRepo(url)}
        />
 
        {!repoDetails && <h1 className="text-headline-md font-semibold mb-space-md text-on-surface">Target GitHub Repository</h1>}
@@ -199,7 +234,7 @@ export default function ConnectPage() {
          </div>
          {error.includes("Not authenticated") && (
           <button
-           onClick={() => window.location.href = "http://localhost:8000/auth/github/login"}
+           onClick={() => window.location.href = `${API_BASE_URL}/auth/github/login`}
            className="mt-2 bg-primary-container text-on-primary-container px-space-md py-space-sm rounded-lg font-semibold flex items-center gap-2 hover:bg-primary-fixed transition-colors"
           >
            Authenticate with GitHub

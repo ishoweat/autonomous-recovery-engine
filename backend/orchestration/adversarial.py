@@ -109,10 +109,6 @@ class MutationTester:
         try:
             with open(tmp, "w") as fh:
                 fh.write(mutated_code)
-        except OSError:
-            return True  # assume caught if we can't write
-
-        try:
             proc = await asyncio.create_subprocess_exec(
                 *self.test_cmd,
                 tmp,
@@ -121,8 +117,17 @@ class MutationTester:
             )
             await asyncio.wait_for(proc.communicate(), timeout=30)
             return (proc.returncode or 0) != 0
+        except OSError:
+            return True  # assume caught if we can't write
         except Exception:
             return True  # assume caught on subprocess error
+        finally:
+            try:
+                import os
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
 
     async def run(self) -> dict[str, Any]:
         killed = 0

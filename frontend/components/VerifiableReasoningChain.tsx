@@ -46,33 +46,33 @@ export const VerifiableReasoningChain = React.memo(function VerifiableReasoningC
   const affectedFile =
     (rca.affected_file as string) ||
     (rca.file as string) ||
-    "calculator.py";
+    "";
   const lineNumber =
     rca.line_number ||
     rca.line ||
-    42;
+    null;
   const errorType =
     (rca.error_type as string) ||
-    (checkRun?.output?.title?.includes("ZeroDivisionError") ? "ZeroDivisionError" : "KeyError");
+    (checkRun?.output?.title?.includes("ZeroDivisionError") ? "ZeroDivisionError" : "Regression Defect");
 
   const commitSha =
     state.commit_sha ||
     workflowRun?.head_sha ||
     (failurePayload.head_commit as any)?.id ||
-    "c8a1f72";
+    "HEAD";
 
   const repoName =
     state.repository_full_name ||
     state.repository ||
     (failurePayload.repository as any)?.full_name ||
-    "Sahil707-pop/third-ai-testing";
+    "Connected Repository";
 
   const stackTraceText =
     checkRun?.output?.summary ||
     checkRun?.output?.text ||
     workflowRun?.html_url ||
     state.triage_context ||
-    "File calculator.py, line 42 in evaluate: KeyError: 'user_id'";
+    "";
 
   // 2. Nemotron Inference
   const inferenceEvent = events.find((e) => e.event_type === "inference_completed" || e.event_type === "nemotron_completed");
@@ -158,7 +158,7 @@ export const VerifiableReasoningChain = React.memo(function VerifiableReasoningC
                   ERROR
                 </p>
                 <h3 className="mt-0.5 text-sm font-mono font-semibold text-white">
-                  ❌ {errorType} at {affectedFile}:{lineNumber}
+                  ❌ {errorType} in {affectedFile || "target file"}{lineNumber ? `:${lineNumber}` : ""}
                 </h3>
                 <p className="mt-1 text-xs font-mono text-slate-400">
                   Repo: <span className="text-slate-200">{repoName}</span> • Commit:{" "}

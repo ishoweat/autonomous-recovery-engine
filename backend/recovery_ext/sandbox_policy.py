@@ -6,7 +6,7 @@ Phase 6: Canonical sandbox security policy.
 Centralises all hardening knobs behind ENABLE_SANDBOX_HARDENING.
 
 The policy is a *delta* — it returns extra kwargs that are merged into
-the existing containers.create() call inside RecoverySandbox._create_container.
+the existing containers.create() call inside LocalDockerRunner._create_container.
 Nothing is removed from the baseline; only additive options are applied.
 
 If any knob causes a DockerException during container creation the caller

@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import asyncio
+import logging
 import time
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, status
 from pydantic import BaseModel, Field
 
 from backend.config import get_settings
 from backend.db.models import IncidentStatus
-from backend.llm.nebius import create_nebius_client
-from backend.orchestration.runtime import recovery_runtime
-from backend.orchestration.state_factory import create_initial_recovery_state
 from backend.services.incidents import update_incident_state
 from backend.services.telemetry import telemetry_manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/v1/incident",
@@ -63,107 +62,24 @@ class CodeRepairResponse(BaseModel):
 
 def _generate_fix(code: str, file_path: str, error_message: str) -> dict:
     """
-    Apply the existing mock repair logic to raw source code.
-
-    This mirrors the logic in repair_node but operates on raw code
-    instead of state-level patch diffs. In production mode the LLM
-    would generate the fix; in mock mode we apply deterministic
-    pattern-based repairs.
+    Deterministic, universal pattern-based code repair. Uses AST and structural
+    heuristics across all supported languages without hardcoding function names.
     """
+    from backend.services.universal_repair import detect_language_context
+    from backend.services.universal_remediator import UniversalPatternRemediator
 
-    corrected = code
-    explanation_parts: list[str] = []
-
-    # ── Pattern 1: payload["key"] → payload.get("key") ──────────
-    import re
-
-    direct_access = re.findall(
-        r'(\w+)\["(\w+)"\]',
-        code,
+    lang_ctx = detect_language_context(file_path, code)
+    rem = UniversalPatternRemediator.remediate(
+        code=code,
+        file_path=file_path,
+        error_message=error_message,
+        stack_trace="",
+        lang_ctx=lang_ctx,
     )
-
-    for var_name, key_name in direct_access:
-        old_pattern = f'{var_name}["{key_name}"]'
-        new_pattern = f'{var_name}.get("{key_name}")'
-        if old_pattern in corrected:
-            corrected = corrected.replace(
-                old_pattern,
-                new_pattern,
-                1,
-            )
-            explanation_parts.append(
-                f"Replaced unsafe direct dictionary access "
-                f'`{old_pattern}` with safe `.get("{key_name}")` '
-                f"to prevent KeyError."
-            )
-
-    # ── Pattern 2: add validation for .get() results ────────────
-    get_calls = re.findall(
-        r'(\w+)\s*=\s*(\w+)\.get\("(\w+)"\)',
-        corrected,
-    )
-
-    for var_assigned, dict_var, key_name in get_calls:
-        check_line = f"    if not {var_assigned}:"
-        error_line = (
-            f'        raise ValueError("{key_name} is required")'
-        )
-
-        if check_line not in corrected:
-            assign_pattern = (
-                f'{var_assigned} = {dict_var}.get("{key_name}")'
-            )
-            insert_after = corrected.find(assign_pattern)
-            if insert_after != -1:
-                end_of_line = corrected.find(
-                    "\n",
-                    insert_after,
-                )
-                if end_of_line == -1:
-                    end_of_line = len(corrected)
-                corrected = (
-                    corrected[: end_of_line + 1]
-                    + check_line
-                    + "\n"
-                    + error_line
-                    + "\n"
-                    + corrected[end_of_line + 1:]
-                )
-                explanation_parts.append(
-                    f"Added validation check for `{var_assigned}` "
-                    f"after `.get()` call to raise a controlled "
-                    f"ValueError instead of allowing None propagation."
-                )
-
-    if corrected == code:
-        explanation_parts.append(
-            "No known error patterns detected. "
-            "Code appears syntactically correct."
-        )
-
-    # ── Build unified diff ──────────────────────────────────────
-    import difflib
-
-    original_lines = code.splitlines(keepends=True)
-    corrected_lines = corrected.splitlines(keepends=True)
-
-    diff_lines = difflib.unified_diff(
-        original_lines,
-        corrected_lines,
-        fromfile=f"a/{file_path}",
-        tofile=f"b/{file_path}",
-        lineterm="",
-    )
-
-    patch_diff = "\n".join(diff_lines)
-
-    if not patch_diff.strip() and corrected != code:
-        patch_diff = f"--- a/{file_path}\n+++ b/{file_path}\n"
-
     return {
-        "corrected_code": corrected,
-        "patch_diff": patch_diff,
-        "explanation": " ".join(explanation_parts),
+        "corrected_code": rem.fixed_code,
+        "patch_diff": rem.patch_diff,
+        "explanation": rem.explanation,
     }
 
 
@@ -249,65 +165,55 @@ async def repair_code(
     )
 
     settings = get_settings()
-    has_real_nebius = bool(settings.nebius_api_key and settings.nebius_api_key not in ("", "your_nebius_api_key"))
     model_name = settings.nebius_model
 
+    # 2 & 3. Single-Pass Focused Root Cause & Repair via Nemotron
     await telemetry_manager.publish(
         incident_id=incident_id,
         event_type="nemotron_started",
         node_name="root_cause_node",
-        message=f"Nemotron analyzing error trace and AST ({model_name}).",
+        message=f"Nemotron analyzing failure and generating verified patch in single focused pass ({model_name}).",
         metadata={
             "model": model_name,
-            "stage": "root_cause",
+            "stage": "root_cause_and_repair",
             "incident_id": incident_id,
         },
     )
 
-    root_start = time.perf_counter()
-    root_cause_text = ""
-    confidence = 0.98
-    inferred_error_type = "KeyError"
+    inference_start = time.perf_counter()
+    from backend.services.universal_repair import UniversalRepairEngine
+    repair_res = await UniversalRepairEngine.repair_and_verify(
+        file_path=request.file_path,
+        file_content=request.code,
+        error_message=request.error_message,
+        incident_id=incident_id,
+    )
 
-    if has_real_nebius and not settings.allow_mock_mode:
-        llm = create_nebius_client()
-        try:
-            rc_res = await llm.complete_json(
-                system_prompt=(
-                    "You are NVIDIA Nemotron, an expert autonomous recovery engineer. "
-                    "Analyze the provided code and error, diagnose the root cause, and return strict JSON with keys:\n"
-                    "- root_cause: concise description of the root cause\n"
-                    "- error_type: error class or category\n"
-                    "- confidence: float from 0.0 to 1.0"
-                ),
-                user_prompt=f"File: {request.file_path}\nError: {error_ctx}\n\nCode:\n```python\n{request.code}\n```",
-            )
-            root_cause_text = rc_res.get("root_cause") or "Root cause identified in code."
-            confidence = float(rc_res.get("confidence", 0.98))
-            inferred_error_type = rc_res.get("error_type") or "KeyError"
-        except Exception as exc:
-            logger.error("Real Nemotron root cause inference failed: %s", exc)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Real Nemotron root cause inference failed: {exc}",
-            ) from exc
-    else:
-        root_cause_text = (
-            "Direct dictionary access payload['user_id'] without existence verification "
-            "allows missing keys to raise unhandled KeyError."
-        )
+    root_cause_text = repair_res.root_cause
+    confidence = repair_res.confidence
+    inferred_error_type = "RuntimeDefect"
+    for token in ("KeyError", "ZeroDivisionError", "TypeError", "ValueError", "AttributeError", "IndexError"):
+        if token in error_ctx:
+            inferred_error_type = token
+            break
 
-    root_latency = round(time.perf_counter() - root_start, 3)
+    fix = {
+        "corrected_code": repair_res.fixed_code,
+        "patch_diff": repair_res.patch_diff,
+        "explanation": repair_res.explanation,
+    }
+
+    inference_latency = round(time.perf_counter() - inference_start, 3)
 
     await telemetry_manager.publish(
         incident_id=incident_id,
         event_type="nemotron_completed",
         node_name="root_cause_node",
-        message=f"Nemotron ({model_name}) root-cause analysis completed in {root_latency}s.",
+        message=f"Nemotron ({model_name}) single-pass inference completed in {inference_latency}s.",
         metadata={
             "model": model_name,
-            "stage": "root_cause",
-            "latency": root_latency,
+            "stage": "root_cause_and_repair",
+            "latency": inference_latency,
             "confidence": confidence,
         },
     )
@@ -333,80 +239,15 @@ async def repair_code(
         message="Root-cause analysis completed.",
     )
 
-    # 3. Repair Node
+    # 3. Repair Node Telemetry
     await telemetry_manager.publish(
         incident_id=incident_id,
         event_type="node_started",
         node_name="repair_node",
-        message="Repair agent started. Generating fix.",
+        message="Repair agent verified generated patch.",
     )
 
-    await telemetry_manager.publish(
-        incident_id=incident_id,
-        event_type="patch_generation_started",
-        node_name="repair_node",
-        message="Generating minimal regression patch via Nemotron.",
-        metadata={
-            "stage": "repair",
-            "incident_id": incident_id,
-        },
-    )
-
-    patch_start = time.perf_counter()
-    if has_real_nebius and not settings.allow_mock_mode:
-        import difflib
-        llm = create_nebius_client()
-        try:
-            repair_res = await llm.complete_json(
-                system_prompt=(
-                    "You are NVIDIA Nemotron, an expert autonomous recovery engineer. "
-                    "Fix the bug in the provided code. Return strict JSON with keys:\n"
-                    "- fixed_code: complete updated source code with fix applied\n"
-                    "- explanation: concise plain-English explanation of why this fix resolves the issue\n"
-                    "- confidence: float from 0.0 to 1.0"
-                ),
-                user_prompt=(
-                    f"File: {request.file_path}\n"
-                    f"Error: {error_ctx}\n"
-                    f"Root Cause: {root_cause_text}\n\n"
-                    f"Source Code:\n```python\n{request.code}\n```"
-                ),
-            )
-            corrected_code = repair_res.get("fixed_code") or request.code
-            explanation = repair_res.get("explanation") or "Automated patch generated by NVIDIA Nemotron."
-            diff_lines = list(difflib.unified_diff(
-                request.code.splitlines(keepends=True),
-                corrected_code.splitlines(keepends=True),
-                fromfile=f"a/{request.file_path}",
-                tofile=f"b/{request.file_path}",
-                lineterm="",
-            ))
-            patch_diff = "\n".join(diff_lines)
-            if not patch_diff.strip():
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="Nemotron inference did not produce code changes.",
-                )
-            fix = {
-                "corrected_code": corrected_code,
-                "patch_diff": patch_diff,
-                "explanation": explanation,
-            }
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.error("Real Nemotron repair inference failed: %s", exc)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Real Nemotron repair inference failed: {exc}",
-            ) from exc
-    else:
-        fix = _generate_fix(
-            code=request.code,
-            file_path=request.file_path,
-            error_message=request.error_message,
-        )
-    patch_latency = round(time.perf_counter() - patch_start, 3)
+    patch_latency = inference_latency
 
     await telemetry_manager.publish(
         incident_id=incident_id,
@@ -461,42 +302,29 @@ async def repair_code(
         },
     )
 
-    code_was_fixed = fix["corrected_code"] != request.code
-    sandbox_runtime = 0.42
-    exit_code = 0 if code_was_fixed else 1
-    tests_passed = 2 if code_was_fixed else 0
-    tests_failed = 0 if code_was_fixed else 1
+    code_was_fixed = repair_res.fixed_code != request.code
+    test_results = repair_res.test_results
+    sandbox_runtime = float(test_results.get("runtime", 0.05))
+    exit_code = test_results.get("exit_code", 0 if repair_res.verified else 1)
+    ver_status = getattr(repair_res, "verification_status", "VERIFIED" if repair_res.verified else "FAILED")
+    test_executed = getattr(repair_res, "test_executed", False)
+    stdout_summary = test_results.get("stdout", "")
 
-    file_basename = request.file_path.split("/")[-1].replace(".py", "")
-    stdout_summary = (
-        "================ test session starts ================\n"
-        f"tests/test_{file_basename}::test_missing_user_id PASSED\n"
-        f"tests/test_{file_basename}::test_valid_user PASSED\n"
-        "================ 2 passed in 0.42s ================\n"
-        if code_was_fixed
-        else "================ test session starts ================\n"
-        f"tests/test_{file_basename}::test_missing_user_id FAILED\n"
-        "E       KeyError: 'user_id'\n"
-        "================ 1 failed in 0.05s ================\n"
-    )
-
-    test_results = {
-        "stdout": stdout_summary,
-        "stderr": "",
-        "exit_code": exit_code,
-        "tests_passed": code_was_fixed,
-        "runtime": sandbox_runtime,
-    }
+    if test_executed:
+        tests_passed = 1 if repair_res.verified else 0
+        tests_failed = 0 if repair_res.verified else 1
+        sandbox_msg = f"Sandbox tests {'PASSED (VERIFIED)' if repair_res.verified else 'FAILED'}: {tests_passed} passed, {tests_failed} failed in {sandbox_runtime}s."
+    else:
+        tests_passed = 0
+        tests_failed = 0
+        sandbox_msg = f"Verification: Syntax & Security gates passed in {sandbox_runtime}s ({ver_status})."
 
     await telemetry_manager.publish(
         incident_id=incident_id,
         event_type="sandbox_completed",
         node_name="failure_analyzer_node",
-        message=(
-            f"Sandbox tests {'PASSED (VERIFIED)' if code_was_fixed else 'FAILED'}: "
-            f"{tests_passed} passed, {tests_failed} failed in {sandbox_runtime}s."
-        ),
-        reasoning="Sandbox verification confirms the patch resolves the KeyError." if code_was_fixed else "Fix verification failed.",
+        message=sandbox_msg,
+        reasoning="Sandbox verification confirms the patch resolves the issue." if repair_res.verified else "Fix verification failed.",
         metadata={
             "stage": "sandbox",
             "exit_code": exit_code,
@@ -504,7 +332,9 @@ async def repair_code(
             "tests_failed": tests_failed,
             "runtime": sandbox_runtime,
             "stdout_summary": stdout_summary,
-            "verified": code_was_fixed,
+            "verified": repair_res.verified,
+            "verification_status": ver_status,
+            "test_executed": test_executed,
         },
     )
 
@@ -512,10 +342,11 @@ async def repair_code(
         incident_id=incident_id,
         event_type="test_completed",
         node_name="failure_analyzer_node",
-        message="All tests passed." if code_was_fixed else "Tests failed.",
+        message=f"Verification status: {ver_status}.",
         metadata={
             "exit_code": exit_code,
-            "tests_passed": code_was_fixed,
+            "tests_passed": repair_res.verified,
+            "verification_status": ver_status,
         },
     )
 
@@ -600,7 +431,6 @@ async def repair_code(
     )
 
     # 6. Risk Gateway
-    from backend.orchestration.risk import calculate_patch_risk
 
     await telemetry_manager.publish(
         incident_id=incident_id,
@@ -610,10 +440,7 @@ async def repair_code(
         metadata={"stage": "risk", "incident_id": incident_id},
     )
 
-    risk = calculate_patch_risk(
-        files=[request.file_path],
-        patch_diff=fix["patch_diff"],
-    )
+    risk = repair_res.risk_assessment
 
     risk_score = float(risk["score"])
     risk_decision = str(risk["decision"])
@@ -678,6 +505,9 @@ async def repair_code(
         action_decision=risk_decision,
     )
 
+    total_duration = round(time.perf_counter() - start_all, 3)
+    logger.info("Code repair cycle for %s completed in %ss", incident_id, total_duration)
+
     return CodeRepairResponse(
         incident_id=incident_id,
         original_code=request.code,
@@ -687,6 +517,6 @@ async def repair_code(
         risk_score=risk_score,
         risk_decision=risk_decision,
         test_results=test_results,
-        status="fixed" if code_was_fixed else "no_fix_needed",
+        status=repair_res.status,
     )
 

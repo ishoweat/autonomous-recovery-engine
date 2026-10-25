@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Sequence
+from typing import Protocol, Sequence
 
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound
@@ -26,7 +26,11 @@ from backend.sandbox.models import (
 from backend.sandbox.sandbox_cleanup import cleanup_container_and_workspace
 
 
-class RecoverySandbox:
+class SandboxRunner(Protocol):
+    def run(self, repository_path: str | Path, patch_diff: str, incident_id: str = "unknown") -> SandboxResult: ...
+    async def run_async(self, repository_path: str | Path, patch_diff: str, incident_id: str = "unknown") -> SandboxResult: ...
+
+class LocalDockerRunner(SandboxRunner):
     """
     Executes generated patches and tests inside an ephemeral,
     network-isolated Docker container.
@@ -508,3 +512,13 @@ class RecoverySandbox:
             patch_diff,
             incident_id,
         )
+
+
+# Backward-compatibility alias
+RecoverySandbox = LocalDockerRunner
+
+__all__ = [
+    "LocalDockerRunner",
+    "RecoverySandbox",
+    "SandboxRunner",
+]

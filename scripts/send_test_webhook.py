@@ -7,7 +7,7 @@ import sys
 
 def send_webhook(event_type, payload, delivery_id):
     secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "test-secret")
-    url = "http://localhost:8000/api/webhooks/github"
+    url = "http://localhost:8000/webhook/github"
     
     body = json.dumps(payload).encode("utf-8")
     

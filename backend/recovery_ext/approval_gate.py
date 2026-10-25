@@ -1,5 +1,5 @@
 from typing import Any
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone
 import logging
@@ -134,6 +134,24 @@ async def submit_approval(
     incident_id: str,
     request: ApprovalDecisionRequest,
 ):
+    decision = request.decision.lower()
+    if decision not in ["approve", "reject"]:
+        raise HTTPException(status_code=400, detail="Decision must be 'approve' or 'reject'")
+
+    approved = (decision == "approve")
+
+    # If it is an interactive remediate incident (rem-...), publish telemetry and succeed directly
+    if incident_id.startswith("rem-"):
+        from backend.services.telemetry import telemetry_manager
+        await telemetry_manager.publish(
+            incident_id=incident_id,
+            event_type="approval_granted" if approved else "approval_rejected",
+            node_name="human_approval_node",
+            message="Human approval granted by operator." if approved else "Operator rejected automated recovery.",
+            metadata={"operator": request.operator, "approved": approved, "decision": decision},
+        )
+        return {"status": "success", "decision": decision, "incident_id": incident_id}
+
     flags = get_flags()
     if not flags.enable_approval_gate:
         raise HTTPException(status_code=400, detail="Approval gate is not enabled")
@@ -149,12 +167,6 @@ async def submit_approval(
 
     if incident.status != IncidentStatus.AWAITING_APPROVAL:
         raise HTTPException(status_code=409, detail="Incident is not awaiting approval")
-
-    decision = request.decision.lower()
-    if decision not in ["approve", "reject"]:
-        raise HTTPException(status_code=400, detail="Decision must be 'approve' or 'reject'")
-
-    approved = (decision == "approve")
 
     await init_approvals_table()
 

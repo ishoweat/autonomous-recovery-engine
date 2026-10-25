@@ -1,4 +1,5 @@
 import { ShieldCheck, GitPullRequest, Search, FileText } from "lucide-react";
+import { API_BASE_URL } from "@/lib/api";
 
 interface RecoveryCompletePanelProps {
   repository: string;
@@ -150,6 +151,26 @@ export function RecoveryCompletePanel({
       target="_blank"
       rel="noopener noreferrer"
       className="bg-primary text-white px-space-lg py-space-sm rounded-lg font-semibold tracking-wide hover:bg-primary/90 transition-colors flex items-center gap-2"
+      onClick={() => {
+        // Trigger a fake webhook to simulate PR merge for the demo
+        fetch(`${API_BASE_URL}/api/v1/webhooks/github`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-GitHub-Event': 'pull_request',
+            'X-Recovery-Mock': 'true'
+          },
+          body: JSON.stringify({
+            action: 'closed',
+            pull_request: {
+              merged: true,
+              merge_commit_sha: commitSha || "fake_merge_sha",
+              head: { ref: branchName || `recovery/fix-${incidentId}` }
+            },
+            repository: { clone_url: "" }
+          })
+        }).catch(console.error);
+      }}
      >
       <GitPullRequest className="w-4 h-4" /> OPEN GITHUB PR
      </a>

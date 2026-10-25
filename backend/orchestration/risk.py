@@ -171,13 +171,13 @@ def _diff_complexity(
     total_changes = additions + deletions
 
     if total_changes <= 4:
-        score = 0.04
+        score = 0.05
     elif total_changes <= 10:
-        score = 0.10
-    elif total_changes <= 25:
-        score = 0.18
+        score = 0.15
+    elif total_changes <= 100:
+        score = 0.40
     else:
-        score = 0.28
+        score = 0.80
 
     return RiskContribution(
         factor="diff_complexity",
@@ -193,6 +193,7 @@ def calculate_patch_risk(
     *,
     files: list[str],
     patch_diff: str,
+    evidence_confidence: str | None = None,
 ) -> dict[str, object]:
     """Calculate deterministic explainable patch risk."""
 
@@ -202,6 +203,16 @@ def calculate_patch_risk(
         _security_sensitivity(files),
         _diff_complexity(patch_diff),
     ]
+
+    if evidence_confidence:
+        ev_contrib = 0.05 if evidence_confidence == "high" else (0.15 if evidence_confidence == "medium" else 0.35)
+        contributions.append(
+            RiskContribution(
+                factor="external_evidence",
+                contribution=ev_contrib,
+                explanation=f"Tavily external research evidence confidence is '{evidence_confidence}'",
+            )
+        )
 
     raw_score = sum(
         contribution.contribution
@@ -213,6 +224,13 @@ def calculate_patch_risk(
         max(0.0, raw_score),
     )
 
+    # Deterministic adjustment based on external evidence confidence:
+    # confidence none/low -> raise risk and require approval; high -> lower risk
+    if evidence_confidence in ("none", "low"):
+        score = max(score, 0.45)
+    elif evidence_confidence == "high":
+        score = max(0.05, score - 0.15)
+
     import os
     force_score = os.environ.get("FORCE_RISK_SCORE")
     # Only allow override in non-production environments
@@ -222,9 +240,9 @@ def calculate_patch_risk(
         except ValueError:
             pass
 
-    if score < 0.30:
+    if score < 0.30 and evidence_confidence not in ("none", "low"):
         decision = "ALLOW"
-    elif score <= 0.70:
+    elif score <= 0.70 or evidence_confidence in ("none", "low"):
         decision = "APPROVE"
     else:
         decision = "BLOCK"
@@ -237,3 +255,4 @@ def calculate_patch_risk(
         ],
         "decision": decision,
     }
+

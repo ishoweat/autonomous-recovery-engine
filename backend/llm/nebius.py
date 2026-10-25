@@ -97,6 +97,9 @@ class NebiusNemotron:
                 }
                 return _LLM_CACHE[cache_key]
 
+        effective_temp = self.temperature if temperature is None else temperature
+        effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+
         base_kwargs: dict[str, Any] = {
             "model": model or self.model,
             "messages": [
@@ -109,25 +112,25 @@ class NebiusNemotron:
                     "content": user_prompt,
                 },
             ],
-            "temperature": (
-                self.temperature
-                if temperature is None
-                else temperature
-            ),
-            "max_tokens": (
-                self.max_tokens
-                if max_tokens is None
-                else max_tokens
-            ),
+            "temperature": effective_temp,
+            "max_tokens": effective_max_tokens,
         }
         if response_format is not None:
             base_kwargs["response_format"] = response_format
 
-        max_attempts = 2
+        # Disable long thinking tokens when low temperature or fast direct repair is desired
+        if effective_temp <= 0.2:
+            base_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+
+        max_attempts = 3
         for attempt in range(max_attempts):
             create_kwargs = dict(base_kwargs)
             if attempt == 1:
-                logger.warning("Retrying Nebius call with enable_thinking=False due to empty content.")
+                logger.warning("Retrying Nebius call with enable_thinking=False due to empty content or timeout.")
+                create_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            elif attempt == 2:
+                logger.warning(f"Tiering Fallback: Switching model to {settings.active_fast_model} after failures.")
+                create_kwargs["model"] = settings.active_fast_model
                 create_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
             if stream_to_incident_id:
@@ -280,6 +283,9 @@ class NebiusNemotron:
                     "inference_status": "ERROR",
                     "error": "Nebius Token Factory request timed out.",
                 }
+                if attempt < max_attempts - 1:
+                    logger.warning("Nebius API timeout on attempt %d. Will fallback and retry.", attempt)
+                    continue
                 raise NebiusLLMError("Nebius Token Factory request timed out.") from exc
             except APIConnectionError as exc:
                 latency = round(time.perf_counter() - t0, 3)
@@ -294,6 +300,9 @@ class NebiusNemotron:
                     "inference_status": "ERROR",
                     "error": "Unable to connect to Nebius Token Factory.",
                 }
+                if attempt < max_attempts - 1:
+                    logger.warning("Nebius API connection error on attempt %d. Will fallback and retry.", attempt)
+                    continue
                 raise NebiusLLMError("Unable to connect to Nebius Token Factory.") from exc
             except APIStatusError as exc:
                 if response_format is not None and exc.status_code == 400 and attempt == 0:
@@ -325,6 +334,9 @@ class NebiusNemotron:
                     "inference_status": "ERROR",
                     "error": f"Nebius Token Factory returned HTTP {exc.status_code}: {exc.message}",
                 }
+                if attempt < max_attempts - 1:
+                    logger.warning("Nebius API status error %d on attempt %d. Will fallback and retry.", exc.status_code, attempt)
+                    continue
                 raise NebiusLLMError(f"Nebius Token Factory returned HTTP {exc.status_code}: {exc.message}") from exc
 
 
@@ -448,15 +460,28 @@ class NebiusNemotron:
         )
 
     async def close(self) -> None:
-        await self.client.close()
+        self.is_closed = True
+        try:
+            await self.client.close()
+        finally:
+            for k, v in list(_NEBIUS_CLIENT_POOL.items()):
+                if v is self:
+                    _NEBIUS_CLIENT_POOL.pop(k, None)
 
 
-def create_nebius_client() -> NebiusNemotron:
-    """Create the configured Nemotron client."""
+_NEBIUS_CLIENT_POOL: dict[str, NebiusNemotron] = {}
 
+
+def create_nebius_client(force_new: bool = False) -> NebiusNemotron:
+    """Create or retrieve a persistent cached Nemotron client to reuse connections."""
     settings = get_settings()
+    pool_key = f"standard:{settings.nebius_api_key}:{settings.nebius_base_url}:{settings.active_nemotron_model}"
+    if not force_new and pool_key in _NEBIUS_CLIENT_POOL:
+        client = _NEBIUS_CLIENT_POOL[pool_key]
+        if not getattr(client, "is_closed", False):
+            return client
 
-    return NebiusNemotron(
+    client = NebiusNemotron(
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         model=settings.active_nemotron_model,
@@ -464,14 +489,20 @@ def create_nebius_client() -> NebiusNemotron:
         max_tokens=settings.nebius_max_tokens,
         timeout_seconds=settings.nebius_timeout_seconds,
     )
+    _NEBIUS_CLIENT_POOL[pool_key] = client
+    return client
 
 
-def create_nebius_fast_client() -> NebiusNemotron:
-    """Create the configured fast Nemotron client."""
-
+def create_nebius_fast_client(force_new: bool = False) -> NebiusNemotron:
+    """Create or retrieve a persistent cached fast Nemotron client."""
     settings = get_settings()
+    pool_key = f"fast:{settings.nebius_api_key}:{settings.nebius_base_url}:{settings.active_fast_model}"
+    if not force_new and pool_key in _NEBIUS_CLIENT_POOL:
+        client = _NEBIUS_CLIENT_POOL[pool_key]
+        if not getattr(client, "is_closed", False):
+            return client
 
-    return NebiusNemotron(
+    client = NebiusNemotron(
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         model=settings.active_fast_model,
@@ -479,14 +510,20 @@ def create_nebius_fast_client() -> NebiusNemotron:
         max_tokens=settings.nebius_max_tokens,
         timeout_seconds=settings.nebius_timeout_seconds,
     )
+    _NEBIUS_CLIENT_POOL[pool_key] = client
+    return client
 
 
-def create_nebius_strong_client() -> NebiusNemotron:
-    """Create the configured strong Nemotron client."""
-
+def create_nebius_strong_client(force_new: bool = False) -> NebiusNemotron:
+    """Create or retrieve a persistent cached strong Nemotron client."""
     settings = get_settings()
+    pool_key = f"strong:{settings.nebius_api_key}:{settings.nebius_base_url}:{settings.active_strong_model}"
+    if not force_new and pool_key in _NEBIUS_CLIENT_POOL:
+        client = _NEBIUS_CLIENT_POOL[pool_key]
+        if not getattr(client, "is_closed", False):
+            return client
 
-    return NebiusNemotron(
+    client = NebiusNemotron(
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         model=settings.active_strong_model,
@@ -494,3 +531,5 @@ def create_nebius_strong_client() -> NebiusNemotron:
         max_tokens=settings.nebius_max_tokens,
         timeout_seconds=settings.nebius_timeout_seconds,
     )
+    _NEBIUS_CLIENT_POOL[pool_key] = client
+    return client

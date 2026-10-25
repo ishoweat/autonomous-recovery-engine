@@ -39,6 +39,7 @@ async def attempt_auto_merge(
     repository_full_name: str,
     incident_id: str,
     retry_count: int = 0,
+    user_token: str | None = None,
 ) -> AutoMergeResult:
     """
     Attempt to squash-merge a PR if ENABLE_AUTO_MERGE=true and conditions are met.
@@ -58,6 +59,17 @@ async def attempt_auto_merge(
             pr_number=pr_number,
             merge_sha=None,
             reason="ENABLE_AUTO_MERGE is false — PR left open for manual merge.",
+        )
+
+    # Safety gate: Fork PRs MUST NEVER be auto-merged (requires maintainer review).
+    if state.get("access_level") == "FORK" or state.get("fork_repo"):
+        return AutoMergeResult(
+            merged=False,
+            method="skipped",
+            pr_url=pr_url,
+            pr_number=pr_number,
+            merge_sha=None,
+            reason="Fork PRs require maintainer review and manual merge on upstream repository.",
         )
 
     # Safety gate: only ALLOW-decision PRs may be auto-merged.
@@ -99,6 +111,7 @@ async def attempt_auto_merge(
         pr_number=pr_number,
         pr_url=pr_url,
         incident_id=incident_id,
+        user_token=user_token,
     )
 
     # Emit result event
@@ -120,16 +133,17 @@ async def attempt_auto_merge(
     )
     
     if result.merged and result.merge_sha:
-        # Phase 7: Post merge verification poller fallback
+        # Phase 7: Trigger post merge verification on main
         try:
-            from backend.recovery_ext.post_merge import start_bounded_poller
-            await start_bounded_poller(
+            from backend.recovery_ext.post_merge import trigger_post_merge_verification
+            await trigger_post_merge_verification(
                 incident_id=incident_id,
                 pr_number=pr_number,
                 repository_full_name=repository_full_name,
+                merged_sha=result.merge_sha,
             )
         except Exception as e:
-            logger.warning(f"[AUTO_MERGE] Failed to start bounded poller: {e}")
+            logger.warning(f"[AUTO_MERGE] Failed to trigger post-merge verification: {e}")
 
     return result
 
@@ -140,6 +154,7 @@ async def _do_merge(
     pr_number: int,
     pr_url: str,
     incident_id: str,
+    user_token: str | None = None,
 ) -> AutoMergeResult:
     """
     Perform the actual GitHub merge call (synchronous PyGithub in thread).
@@ -152,22 +167,29 @@ async def _do_merge(
             from github.GithubException import GithubException
             from backend.config.github_config import GitHubSettings
 
-            settings = GitHubSettings()  # type: ignore[call-arg]
-            if not settings.token:
+            token_to_use = user_token
+            if not token_to_use or token_to_use == "your_github_token":
+                try:
+                    settings = GitHubSettings()
+                    token_to_use = settings.token
+                except Exception:
+                    pass
+
+            if not token_to_use or token_to_use == "your_github_token":
                 return AutoMergeResult(
                     merged=False,
                     method="error",
                     pr_url=pr_url,
                     pr_number=pr_number,
                     merge_sha=None,
-                    reason="GITHUB_TOKEN not configured; cannot auto-merge.",
+                    reason="GitHub token not configured; cannot auto-merge.",
                 )
 
             try:
-                auth = Auth.Token(settings.token)
+                auth = Auth.Token(token_to_use)
                 gh = Github(auth=auth, timeout=20)
             except Exception:
-                gh = Github(login_or_token=settings.token, timeout=20)
+                gh = Github(login_or_token=token_to_use, timeout=20)
 
             repo = gh.get_repo(repository_full_name)
             pr = repo.get_pull(pr_number)
@@ -182,14 +204,26 @@ async def _do_merge(
                     reason="PR was already merged.",
                 )
 
-            if not pr.mergeable:
+            import time
+
+            # GitHub computes mergeability asynchronously; wait up to 5s if mergeable is None
+            for _ in range(5):
+                if pr.mergeable is not None:
+                    break
+                time.sleep(1.0)
+                try:
+                    pr = repo.get_pull(pr_number)
+                except Exception:
+                    pass
+
+            if pr.mergeable is False:
                 return AutoMergeResult(
                     merged=False,
                     method="refused",
                     pr_url=pr_url,
                     pr_number=pr_number,
                     merge_sha=None,
-                    reason=f"PR is not mergeable (state: {pr.mergeable_state}). Left open.",
+                    reason=f"PR has merge conflicts (state: {pr.mergeable_state}). Left open.",
                 )
 
             commit_msg = (

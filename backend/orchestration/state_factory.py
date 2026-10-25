@@ -91,6 +91,23 @@ def create_initial_recovery_state(
         or ""
     )
 
+    if not failure_file:
+        import re
+        combined_err = f"{error_message} {stack_trace}"
+        matches = re.findall(r'File "([^"]+\.py)"', combined_err)
+        if matches:
+            # T0.3: Target Resolver - deepest in-repo non-test source frame
+            for match in reversed(matches):
+                if not any(b in match for b in ["tests/", "test/", ".github/", "site-packages/"]) and not match.startswith("test_") and not match.endswith("_test.py") and not ".spec." in match and not ".test." in match:
+                    failure_file = match
+                    break
+            if not failure_file:
+                failure_file = matches[-1]
+        else:
+            match = re.search(r'([a-zA-Z0-9_/\-]+\.py)', combined_err)
+            if match:
+                failure_file = match.group(1)
+
     from backend.config import get_settings
     runtime_model = get_settings().nebius_model
 

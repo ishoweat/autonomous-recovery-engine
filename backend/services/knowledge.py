@@ -87,7 +87,10 @@ async def record_learned_pattern(
         patch_pattern=patch_pattern,
         confidence=min(1.0, max(0.0, confidence)),
         file_path=file_path,
-        pattern_metadata=pattern_metadata or {},
+        pattern_metadata={
+            **(pattern_metadata or {}),
+            "patch_hash": str(hash(patch_pattern)) if patch_pattern else None,
+        },
     )
 
     if session is not None:

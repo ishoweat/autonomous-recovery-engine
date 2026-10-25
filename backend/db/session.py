@@ -15,11 +15,25 @@ settings = get_settings()
 database_url = settings.database_url
 
 if database_url.startswith("sqlite"):
+    from sqlalchemy.pool import NullPool
     engine = create_async_engine(
         database_url,
+        poolclass=NullPool,
         connect_args={"check_same_thread": False, "timeout": 30.0},
         echo=False,
     )
+
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout=30000;")
+            cursor.close()
+        except Exception:
+            pass
 else:
     engine = create_async_engine(
         database_url,

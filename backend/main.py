@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -14,7 +20,7 @@ from backend.api.learning import router as learning_router
 from backend.api.remediate import router as remediate_router
 from backend.api.roi import router as roi_router
 from backend.api.v2 import router as v2_router
-from backend.api.webhooks import router as webhook_router
+from backend.api.webhooks import router as webhook_router, v1_webhook_router
 from backend.config import get_settings
 from backend.db.base import Base
 from backend.db.session import engine
@@ -99,6 +105,11 @@ async def lifespan(app: FastAPI):
             await engine.dispose()
         except Exception:
             pass
+        try:
+            from backend.services.http_client import close_shared_client
+            await close_shared_client()
+        except Exception:
+            pass
 
 
 def create_app() -> FastAPI:
@@ -115,10 +126,14 @@ def create_app() -> FastAPI:
     )
 
     import os
-    cors_origins = os.environ.get("CORS_ORIGINS", "*").split(",")
+    cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
+    for local_dev_url in ["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"]:
+        if local_dev_url not in cors_origins:
+            cors_origins.append(local_dev_url)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -132,6 +147,9 @@ def create_app() -> FastAPI:
 
     application.include_router(
         webhook_router
+    )
+    application.include_router(
+        v1_webhook_router
     )
 
     from backend.recovery_ext.flags import get_flags

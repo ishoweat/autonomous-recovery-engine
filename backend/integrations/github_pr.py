@@ -7,6 +7,7 @@ def build_recovery_pr_body(
     risk: dict,
     test_results: dict,
     patch_diff: str,
+    evidence: dict | None = None,
 ) -> str:
     root_cause_summary = str(
         root_cause.get(
@@ -14,6 +15,22 @@ def build_recovery_pr_body(
             "Automated root-cause analysis completed.",
         )
     )
+
+    sources_section = "### Sources\n\nNo external evidence found."
+    if evidence:
+        sources = evidence.get("sources") or []
+        confidence = str(evidence.get("confidence", "none")).lower()
+        if sources and confidence != "none":
+            items = []
+            for s in sources:
+                sid = s.get("id", 1)
+                title = s.get("title") or f"Source {sid}"
+                url = s.get("url") or "#"
+                snippet = (s.get("snippet") or s.get("extracted") or "").strip().replace("\n", " ")
+                summary = snippet[:140] + "..." if len(snippet) > 140 else (snippet or "Reference fix pattern")
+                support = s.get("support") or "Supports root-cause diagnosis and recovery patch"
+                items.append(f"- [{sid}] [{title}]({url}) - {summary} *(Supports: {support})*")
+            sources_section = "### Sources\n\n" + "\n".join(items)
 
     risk_score = float(
         risk.get(
@@ -57,6 +74,8 @@ def build_recovery_pr_body(
 
 {root_cause_summary}
 
+{sources_section}
+
 ### Explainable Risk
 
 **Score:** `{risk_score:.4f}`
@@ -67,13 +86,26 @@ def build_recovery_pr_body(
 
 {breakdown_text}
 
-### Verification
+### Verification (RED -> GREEN)
 
-- Test exit code: `{exit_code}`
-- Tests passed: `{test_results.get("tests_passed", False)}`
-- Timed out: `{test_results.get("timed_out", False)}`
+<details>
+<summary>Pre-Patch RED (Failing)</summary>
+
+```
+{test_results.get("before_test", {}).get("stdout", "No pre-patch output")}
+```
+</details>
+
+<details>
+<summary>Post-Patch GREEN (Passing)</summary>
+
+```
+{test_results.get("after_test", {}).get("stdout", "No post-patch output")}
+```
+</details>
 
 ### Generated Patch
+**Patch Hash:** `{hash(patch_diff)}`
 
 ```diff
 {patch_diff}

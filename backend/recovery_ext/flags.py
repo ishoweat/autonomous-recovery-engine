@@ -64,6 +64,11 @@ class ExtFlags(BaseSettings):
         default=False,
         validation_alias="PUBLIC_DEMO_MODE",
     )
+    enable_fork_and_pr: bool = Field(
+        default=False,
+        validation_alias="ENABLE_FORK_AND_PR",
+    )
+
 
 
 @lru_cache

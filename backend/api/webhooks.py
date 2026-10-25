@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
+import httpx
+import logging
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
@@ -30,9 +35,17 @@ router = APIRouter(
     prefix="/webhook",
     tags=["GitHub Webhooks"],
 )
+v1_webhook_router = APIRouter(
+    prefix="/api/v1/webhooks",
+    tags=["GitHub Webhooks"],
+)
 
 
 @router.post(
+    "/github",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+@v1_webhook_router.post(
     "/github",
     status_code=status.HTTP_202_ACCEPTED,
 )
@@ -114,6 +127,150 @@ async def github_webhook(
         == "true"
     )
 
+    # T4.1: Merge Listener for PRs
+    if x_github_event == "pull_request":
+        action = payload.get("action")
+        pr_data = payload.get("pull_request", {})
+        merged = pr_data.get("merged", False) or payload.get("merged", False)
+        
+        if (action == "closed" and merged) or merged:
+            merge_commit_sha = pr_data.get("merge_commit_sha") or payload.get("merge_commit_sha") or "HEAD"
+            branch_name = pr_data.get("head", {}).get("ref", "")
+            run_id_val = str(payload.get("run_id") or payload.get("workflow_run", {}).get("id") or payload.get("id") or "")
+            incident_id_short = ""
+            if branch_name.startswith("recovery/") or branch_name.startswith("ai-recovery/") or branch_name.startswith("fix/"):
+                incident_id_short = branch_name.replace("ai-recovery/", "").replace("recovery/", "").replace("fix/", "").split("-")[0]
+            repo_url = payload.get("repository", {}).get("clone_url")
+            
+            # Background task for post-merge verification
+            async def run_post_merge(repo_url, sha, incident_short, run_id, mock: bool):
+                logger.info("[POST_MERGE] started")
+                try:
+                    async def _exec():
+                        import tempfile
+                        import subprocess
+                        from backend.db.session import AsyncSessionLocal
+                        from backend.db.models import Incident, IncidentStatus, SystemAnalytics
+                        from sqlalchemy import select
+                        from backend.orchestration.telemetry import emit_node_event
+                        
+                        block_finishing = os.getenv("POST_MERGE_BLOCK_FINISHING", "").lower() in ("true", "1")
+                        if block_finishing:
+                            await asyncio.sleep(70)
+
+                        force_exit = os.getenv("POST_MERGE_FORCE_EXIT_CODE")
+                        exit_code = int(force_exit) if force_exit is not None else 0
+                        
+                        if not mock and repo_url and force_exit is None:
+                            with tempfile.TemporaryDirectory() as tmpdir:
+                                subprocess.run(["git", "clone", "--depth", "50", repo_url, "."], cwd=tmpdir, check=True, timeout=30)
+                                if sha and sha != "HEAD":
+                                    subprocess.run(["git", "checkout", sha], cwd=tmpdir, check=True, timeout=10)
+                                res = subprocess.run(["pytest", "-q", "--disable-warnings", "--maxfail=1"], cwd=tmpdir, capture_output=True, text=True, timeout=45)
+                                exit_code = res.returncode
+                        else:
+                            if force_exit is None:
+                                logger.info("Skipping real post-merge verification due to mock mode.")
+                                await asyncio.sleep(0.1)
+                            
+                        async with AsyncSessionLocal() as async_session:
+                            cand = None
+                            if incident_short:
+                                stmt = select(Incident).where(Incident.incident_id.contains(incident_short))
+                                result = await async_session.execute(stmt)
+                                cand = result.scalars().first()
+                            if not cand and run_id:
+                                stmt = select(Incident).order_by(Incident.created_at.desc()).limit(20)
+                                result = await async_session.execute(stmt)
+                                for c in result.scalars().all():
+                                    cand_payload = c.github_payload or {}
+                                    c_run_id = str(cand_payload.get("workflow_run", {}).get("id", "")) or str(cand_payload.get("id", ""))
+                                    if c_run_id and c_run_id == run_id:
+                                        cand = c
+                                        break
+                            if not cand:
+                                stmt = select(Incident).order_by(Incident.created_at.desc()).limit(1)
+                                result = await async_session.execute(stmt)
+                                cand = result.scalars().first()
+
+                            inc_id = cand.incident_id if cand else (incident_short or "inc_simulated")
+                            
+                            status = IncidentStatus.VERIFIED_POST_MERGE if exit_code == 0 else IncidentStatus.FAILED
+                            if cand:
+                                cand.status = status
+                                if exit_code == 0:
+                                    analytics_stmt = select(SystemAnalytics).limit(1)
+                                    analytics_res = await async_session.execute(analytics_stmt)
+                                    analytics_row = analytics_res.scalars().first()
+                                    if not analytics_row:
+                                        analytics_row = SystemAnalytics(resolutions_count=1)
+                                        async_session.add(analytics_row)
+                                    else:
+                                        analytics_row.resolutions_count += 1
+                                await async_session.commit()
+                                
+                            if exit_code == 0:
+                                logger.info("[POST_MERGE] passed (exit 0)")
+                            else:
+                                logger.error("[POST_MERGE] failed")
+
+                            await emit_node_event(
+                                incident_id=inc_id,
+                                event_type="post_merge_verify",
+                                node_name="post_merge",
+                                message="Verified on main" if exit_code == 0 else f"Tests failed on main (exit {exit_code})",
+                                metadata={"merge_sha": sha, "exit_code": exit_code, "tests_passed": exit_code == 0}
+                            )
+                            logger.info(f"Post-merge verification for {inc_id}: exit_code={exit_code}")
+
+                    await asyncio.wait_for(_exec(), timeout=60.0)
+
+                except asyncio.TimeoutError:
+                    logger.error("[POST_MERGE] timeout")
+                    try:
+                        from backend.db.session import AsyncSessionLocal
+                        from backend.db.models import Incident, IncidentStatus
+                        from sqlalchemy import select
+                        from backend.orchestration.telemetry import emit_node_event
+                        async with AsyncSessionLocal() as async_session:
+                            cand = None
+                            if incident_short:
+                                stmt = select(Incident).where(Incident.incident_id.contains(incident_short))
+                                res = await async_session.execute(stmt)
+                                cand = res.scalars().first()
+                            if not cand and run_id:
+                                stmt = select(Incident).order_by(Incident.created_at.desc()).limit(20)
+                                res = await async_session.execute(stmt)
+                                for c in res.scalars().all():
+                                    cand_payload = c.github_payload or {}
+                                    c_run_id = str(cand_payload.get("workflow_run", {}).get("id", "")) or str(cand_payload.get("id", ""))
+                                    if c_run_id and c_run_id == run_id:
+                                        cand = c
+                                        break
+                            if not cand:
+                                stmt = select(Incident).order_by(Incident.created_at.desc()).limit(1)
+                                res = await async_session.execute(stmt)
+                                cand = res.scalars().first()
+                            inc_id = cand.incident_id if cand else (incident_short or "inc_simulated")
+                            if cand:
+                                cand.status = IncidentStatus.FAILED
+                                await async_session.commit()
+                        await emit_node_event(
+                            incident_id=inc_id,
+                            event_type="post_merge_verify",
+                            node_name="post_merge",
+                            message="[POST_MERGE] Verification timed out after 60s.",
+                            metadata={"exit_code": 1, "tests_passed": False, "error": "Post-merge verification timed out after 60s"}
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error("[POST_MERGE] failed")
+                    logger.error(f"Post-merge verification failed: {e}")
+            
+            asyncio.create_task(run_post_merge(repo_url, merge_commit_sha, incident_id_short, run_id_val, is_mock_mode))
+            return {"accepted": True, "message": "Post-merge verification triggered."}
+
     # 1. Non-failure filter for workflow_run events
     if parsed.event_name in {"workflow_run", "check_run"} and not parsed.is_failure_event and not is_mock_mode:
         return {
@@ -149,6 +306,39 @@ async def github_webhook(
 
     incident_id = f"inc_{uuid.uuid4().hex}"
 
+    # T1.1: Fetch raw workflow logs for the failed job
+    error_message = ""
+    stack_trace = ""
+    if parsed.event_name == "workflow_run" and parsed.is_failure_event and parsed.github_run_id:
+        try:
+            from backend.config.github_config import get_github_settings
+            gh_settings = get_github_settings()
+            if gh_settings.token:
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    headers = {
+                        "Authorization": f"Bearer {gh_settings.token}",
+                        "Accept": "application/vnd.github.v3+json",
+                    }
+                    jobs_url = f"https://api.github.com/repos/{parsed.repository}/actions/runs/{parsed.github_run_id}/jobs"
+                    jobs_resp = await client.get(jobs_url, headers=headers)
+                    if jobs_resp.status_code == 200:
+                        jobs_data = jobs_resp.json()
+                        for job in jobs_data.get("jobs", []):
+                            if job.get("conclusion") == "failure":
+                                job_id = job.get("id")
+                                logs_url = f"https://api.github.com/repos/{parsed.repository}/actions/jobs/{job_id}/logs"
+                                logs_resp = await client.get(logs_url, headers=headers)
+                                if logs_resp.status_code == 200:
+                                    logs = logs_resp.text
+                                    if "Traceback (most recent call last):" in logs:
+                                        parts = logs.split("Traceback (most recent call last):")
+                                        stack_trace = "Traceback (most recent call last):\n" + parts[-1].split("===========================")[0]
+                                    else:
+                                        stack_trace = logs[-2000:]
+                                    break
+        except Exception as e:
+            logger.warning(f"Failed to fetch workflow logs: {e}")
+
     owner = payload.get("repository", {}).get("owner", {}).get("login", "")
     repo_name = payload.get("repository", {}).get("name", "")
     extracted_branch = payload.get("ref", "").replace("refs/heads/", "") if payload.get("ref") else parsed.branch
@@ -161,6 +351,8 @@ async def github_webhook(
         incident_id=incident_id,
         github_payload={
             **parsed.payload,
+            "error_message": error_message,
+            "stack_trace": stack_trace,
             "_recovery_metadata": {
                 "event_name": parsed.event_name,
                 "is_failure_event": (

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { PresentationModeToggle } from "@/components/PresentationModeToggle";
 
 export const metadata: Metadata = {
  title: "Autonomous Recovery Engine | NVIDIA Nemotron Mission Control",
@@ -33,6 +34,7 @@ export default function RootLayout({
    </head>
    <body className="bg-surface-container-lowest font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container min-h-screen">
     {children}
+    <PresentationModeToggle />
    </body>
   </html>
  );

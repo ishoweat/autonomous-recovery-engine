@@ -7,7 +7,7 @@ from backend.sandbox.models import (
     SandboxExecutionError,
     SandboxResult,
 )
-from backend.sandbox.sandbox import RecoverySandbox
+from backend.sandbox.sandbox import LocalDockerRunner, RecoverySandbox, SandboxRunner
 
 __all__ = [
     "CommandResult",
@@ -17,5 +17,7 @@ __all__ = [
     "SandboxError",
     "SandboxExecutionError",
     "SandboxResult",
+    "LocalDockerRunner",
     "RecoverySandbox",
+    "SandboxRunner",
 ]

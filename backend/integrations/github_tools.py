@@ -253,6 +253,17 @@ class GitHubTools:
                 )
             return repository_full_name, "", "WRITE", ""
 
+        from backend.recovery_ext.flags import get_flags
+        if not get_flags().enable_fork_and_pr:
+            logger.info("No WRITE access to %s and ENABLE_FORK_AND_PR is false — defaulting to WRITE path.", repository_full_name)
+            if on_event:
+                await on_event(
+                    "access_determined",
+                    f"WRITE access assumed for {repository_full_name} (ENABLE_FORK_AND_PR is false).",
+                    {"access_level": "WRITE", "original_repo": repository_full_name},
+                )
+            return repository_full_name, "", "WRITE", ""
+
         logger.info("No WRITE access to %s — forking ...", repository_full_name)
         if on_event:
             await on_event(
@@ -360,6 +371,10 @@ class GitHubTools:
 
         if not normalized_path:
             raise GitHubCommitError("Cannot commit an empty file path.")
+
+        if normalized_path.endswith(".py") and content:
+            from backend.services.code_cleaner import validate_and_clean_code
+            content, _, _ = validate_and_clean_code(content)
 
         try:
             existing_file = repository.get_contents(
@@ -616,6 +631,34 @@ class GitHubTools:
             fork_repo=fork_full_name,
             reused=False,
         )
+
+    # ------------------------------------------------------------------
+    # Status API
+    # ------------------------------------------------------------------
+
+    def create_commit_status(
+        self,
+        repository_full_name: str,
+        commit_sha: str,
+        state: str,
+        target_url: str,
+        description: str,
+        context: str = "ARE/Verification",
+    ) -> None:
+        """
+        Create a commit status. State can be 'error', 'failure', 'pending', or 'success'.
+        """
+        try:
+            repo = self._get_repository(repository_full_name)
+            repo.get_commit(commit_sha).create_status(
+                state=state,
+                target_url=target_url,
+                description=description[:140],
+                context=context,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to create commit status: {exc}")
 
     # ------------------------------------------------------------------
     # Legacy entry point (kept for backward compatibility)

@@ -4,8 +4,11 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from collections.abc import AsyncGenerator
+from typing import Any, Optional
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+import httpx
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +36,7 @@ from backend.services.incidents import (
 )
 from backend.services.telemetry import telemetry_manager
 from backend.api.auth import get_current_session
+from backend.api.github_workspace import _parse_repo_url
 
 from pydantic import BaseModel
 class IngestRepoRequest(BaseModel):
@@ -109,10 +113,6 @@ async def get_incident_endpoint(
         incident
     )
 
-from fastapi import Cookie
-import httpx
-import uuid
-from backend.api.github_workspace import _parse_repo_url
 
 @router.post(
     "/ingest-repo",
@@ -169,17 +169,19 @@ async def ingest_repo_endpoint(
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    # Fetch latest workflow runs from GitHub API
-    async with httpx.AsyncClient() as client:
-        # Check permissions & repo access
-        repo_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers)
-        if repo_resp.status_code in (401, 403) and "Authorization" in headers:
-            headers_unauth = {k: v for k, v in headers.items() if k != "Authorization"}
-            repo_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers_unauth)
-            headers = headers_unauth
+    # Fetch latest workflow runs from GitHub API using persistent shared HTTP client
+    from backend.services.http_client import get_shared_client
+    client = get_shared_client()
 
-        if repo_resp.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"Repository '{owner}/{repo}' not found on GitHub. Please check the URL, owner, and repository name.")
+    # Check permissions & repo access
+    repo_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers)
+    if repo_resp.status_code in (401, 403) and "Authorization" in headers:
+        headers_unauth = {k: v for k, v in headers.items() if k != "Authorization"}
+        repo_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers_unauth)
+        headers = headers_unauth
+
+    if repo_resp.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"Repository '{owner}/{repo}' not found on GitHub. Please check the URL, owner, and repository name.")
 
         # Query workflow runs with status=failure
         runs_resp = await client.get(
@@ -475,12 +477,10 @@ async def stream_incident(
 async def stream_incident_events(
     incident_id: str,
     request: Request,
-    session: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     return await stream_incident(
         incident_id=incident_id,
         request=request,
-        session=session,
     )
 
 

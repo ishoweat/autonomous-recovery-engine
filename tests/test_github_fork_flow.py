@@ -139,19 +139,24 @@ async def test_fork_path_emits_all_six_events():
     async def capture_event(event_type, message, metadata):
         events.append((event_type, message, metadata))
 
-    with patch("backend.integrations.github_tools.Github", mock_github_class):
-        gh = GitHubTools(_make_settings())
-        result = await gh.create_recovery_pr_full(
-            repository_full_name=UPSTREAM,
-            branch_name=BRANCH,
-            base_branch="main",
-            file_path="calculator.py",
-            content="def add(a, b): return a + b\n",
-            commit_message="fix(calculator.py): add type safety",
-            pr_title="fix(calculator.py): add type safety",
-            pr_body="Automated recovery PR.",
-            on_event=capture_event,
-        )
+    from backend.recovery_ext.flags import get_flags
+    get_flags.cache_clear()
+    with patch.dict(os.environ, {"ENABLE_FORK_AND_PR": "true"}):
+        with patch("backend.integrations.github_tools.Github", mock_github_class):
+            gh = GitHubTools(_make_settings())
+            result = await gh.create_recovery_pr_full(
+                repository_full_name=UPSTREAM,
+                branch_name=BRANCH,
+                base_branch="main",
+                file_path="calculator.py",
+                content="def add(a, b): return a + b\n",
+                commit_message="fix(calculator.py): add type safety",
+                pr_title="fix(calculator.py): add type safety",
+                pr_body="Automated recovery PR.",
+                on_event=capture_event,
+            )
+    get_flags.cache_clear()
+
 
     # ── Assertions: PullRequestResult ────────────────────────────────────
     assert result.access_level == "FORK", f"Expected FORK, got {result.access_level}"

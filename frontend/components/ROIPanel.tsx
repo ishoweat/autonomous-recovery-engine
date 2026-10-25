@@ -17,7 +17,7 @@ import {
  Legend,
 } from "recharts";
 import { Clock, DollarSign, ShieldCheck, TrendingDown } from "lucide-react";
-import { fetchROIDashboard } from "@/lib/api";
+import { fetchROIDashboard, API_BASE_URL } from "@/lib/api";
 import type { ROIDashboardData } from "@/lib/types";
 
 // ── Chart palette aligned with the project's brand colours ────────────────────
@@ -66,7 +66,7 @@ export function ROIPanel({ defaultDays = 30 }: ROIPanelProps) {
    .catch((e) => setError(String(e?.message ?? e)))
    .finally(() => setLoading(false));
   // Phase 5: fetch blocked count from new table (best-effort, non-blocking)
-  fetch(`/api/v1/roi/blocked-incidents`)
+  fetch(`${API_BASE_URL}/api/v1/roi/blocked-incidents`)
    .then(r => r.ok ? r.json() : { blocked_incidents: 0 })
    .then(j => setBlockedCount(j.blocked_incidents ?? 0))
    .catch(() => {});

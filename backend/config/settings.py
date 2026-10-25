@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +19,15 @@ class Settings(BaseSettings):
 
     app_name: str = "Autonomous Recovery Engine"
     environment: str = "development"
+    frontend_url: str = Field(
+        default="http://localhost:3000",
+        validation_alias="FRONTEND_URL",
+    )
+
+    @field_validator("frontend_url", mode="after")
+    @classmethod
+    def _strip_frontend_url(cls, v: str) -> str:
+        return v.rstrip("/") if v else "http://localhost:3000"
 
     database_url: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/recovery_engine",
@@ -46,7 +55,7 @@ class Settings(BaseSettings):
     )
 
     github_redirect_uri: str = Field(
-        default="http://127.0.0.1:8000/api/auth/github/callback",
+        default="http://127.0.0.1:8000/auth/github/callback",
         validation_alias="GITHUB_REDIRECT_URI",
     )
 

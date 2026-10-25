@@ -642,3 +642,21 @@ class FixRecord(Base):
             "created_at",
         ),
     )
+
+
+class SystemAnalytics(Base):
+    """System-wide analytics and aggregated counters."""
+
+    __tablename__ = "system_analytics"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+    resolutions_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+

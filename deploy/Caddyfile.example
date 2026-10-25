@@ -1,0 +1,17 @@
+# deploy/Caddyfile.example
+# Replace api.yourdomain.com with your public backend domain
+
+api.yourdomain.com {
+    reverse_proxy localhost:8000 {
+        # flush_interval -1 disables buffering for real-time Server-Sent Events (SSE)
+        flush_interval -1
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+    }
+
+    encode gzip zstd
+}

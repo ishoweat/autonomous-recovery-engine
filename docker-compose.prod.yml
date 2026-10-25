@@ -47,10 +47,36 @@ services:
 
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_REDIRECT_URI: ${GITHUB_REDIRECT_URI:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      DATABASE_PATH: /data/recovery.db
+
+      SHADOW_MODE: ${SHADOW_MODE:-true}
+      PUBLIC_DEMO_MODE: ${PUBLIC_DEMO_MODE:-false}
+      ENABLE_PERSISTENCE: ${ENABLE_PERSISTENCE:-false}
+      ENABLE_WEBHOOK_INGRESS: ${ENABLE_WEBHOOK_INGRESS:-false}
+      ENABLE_APPROVAL_GATE: ${ENABLE_APPROVAL_GATE:-false}
+      ENABLE_BLOCK_ESCALATION: ${ENABLE_BLOCK_ESCALATION:-false}
+      ENABLE_SANDBOX_HARDENING: ${ENABLE_SANDBOX_HARDENING:-false}
+      ENABLE_AUTO_MERGE: ${ENABLE_AUTO_MERGE:-false}
+      ENABLE_POST_MERGE_VERIFY: ${ENABLE_POST_MERGE_VERIFY:-false}
+      ENABLE_REAL_METRICS: ${ENABLE_REAL_METRICS:-false}
+      ENABLE_RATE_LIMITING: ${ENABLE_RATE_LIMITING:-false}
+      ENABLE_TAVILY_RESEARCH: ${ENABLE_TAVILY_RESEARCH:-false}
+      ENABLE_FORK_AND_PR: ${ENABLE_FORK_AND_PR:-false}
+      ENABLE_LLM_CACHE: ${ENABLE_LLM_CACHE:-false}
+      ENABLE_BENCHMARK_VIEW: ${ENABLE_BENCHMARK_VIEW:-false}
+      ENABLE_DEMO_SCENARIOS: ${ENABLE_DEMO_SCENARIOS:-false}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - are_data:/data
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     healthcheck:
       test:
         [
@@ -99,6 +125,7 @@ services:
 
 volumes:
   postgres_data:
+  are_data:
 
 networks:
   recovery_internal:

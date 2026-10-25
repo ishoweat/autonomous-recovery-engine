@@ -170,7 +170,7 @@ async def github_callback(code: str = Query(...)):
     session_id = session["session_id"]
 
     # Redirect to cookie helper with session_id only (never expose raw OAuth token in URL)
-    redirect_url = f"http://localhost:8000/auth/github/set-cookie?session_id={session_id}"
+    redirect_url = f"/auth/github/set-cookie?session_id={session_id}"
     return RedirectResponse(url=redirect_url)
 
 
@@ -181,15 +181,19 @@ async def github_set_cookie(
     token: Optional[str] = Query(None),
 ):
     settings = get_settings()
-    frontend_url = f"http://localhost:3000/detect?session_id={session_id}"
+    frontend_url = f"{settings.frontend_url}/detect?session_id={session_id}"
     response = RedirectResponse(url=frontend_url)
+
+    is_prod = settings.environment == "production"
+    cookie_samesite = "none" if is_prod else "lax"
+    cookie_secure = True if is_prod else (settings.environment != "development")
 
     response.set_cookie(
         key="session_id",
         value=session_id,
         httponly=True,
-        secure=settings.environment != "development",
-        samesite="lax",
+        secure=cookie_secure,
+        samesite=cookie_samesite,
         max_age=session_service.default_ttl,
     )
 
@@ -205,8 +209,8 @@ async def github_set_cookie(
             key="github_token",
             value=resolved_token,
             httponly=True,
-            secure=settings.environment != "development",
-            samesite="lax",
+            secure=cookie_secure,
+            samesite=cookie_samesite,
             max_age=session_service.default_ttl,
         )
     return response
@@ -242,20 +246,24 @@ async def token_login(payload: TokenLoginRequest, response: Response):
     session = await session_service.create_session(user_info, token, ttl=ttl)
 
     settings = get_settings()
+    is_prod = settings.environment == "production"
+    cookie_samesite = "none" if is_prod else "lax"
+    cookie_secure = True if is_prod else (settings.environment != "development")
+
     response.set_cookie(
         key="session_id",
         value=session["session_id"],
         httponly=True,
-        secure=settings.environment != "development",
-        samesite="lax",
+        secure=cookie_secure,
+        samesite=cookie_samesite,
         max_age=ttl,
     )
     response.set_cookie(
         key="github_token",
         value=token,
         httponly=True,
-        secure=settings.environment != "development",
-        samesite="lax",
+        secure=cookie_secure,
+        samesite=cookie_samesite,
         max_age=ttl,
     )
 

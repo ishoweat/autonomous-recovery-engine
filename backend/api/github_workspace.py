@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, List, Optional
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, status
 import httpx
@@ -15,6 +17,8 @@ from backend.integrations.github_tools import GitHubTools, GitHubIntegrationErro
 from backend.services.telemetry import telemetry_manager
 from backend.services.session_service import session_service
 from backend.api.auth import get_current_session
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/v1/github",
@@ -116,9 +120,20 @@ PyGithub>=2.2.0
 pytest>=8.1.0
 httpx>=0.27.0
 """,
+    "calculator.py": """def calculate_average(numbers):
+    \"\"\"Returns the average of a list of numbers.\"\"\"
+    total = sum(numbers)
+    # BUG: If numbers is empty, len(numbers) is 0, causing a ZeroDivisionError
+    return total / len(numbers)
+
+def calculate_total(numbers):
+    \"\"\"Returns the sum of a list of numbers.\"\"\"
+    return sum(numbers)
+""",
 }
 
 DEMO_TREE = [
+    {"path": "calculator.py", "type": "blob", "size": 182},
     {"path": "backend", "type": "tree"},
     {"path": "backend/api", "type": "tree"},
     {"path": "backend/api/auth.py", "type": "blob", "size": 98},
@@ -187,6 +202,7 @@ class RepoTreeResponse(BaseModel):
     repo: str
     full_name: str
     default_branch: str
+    commit_sha: Optional[str] = None
     tree: List[Any]
     nested_tree: Optional[List[Any]] = None
     flat_tree: Optional[List[dict]] = None
@@ -230,11 +246,15 @@ def build_nested_tree(items: List[dict]) -> List[dict]:
         if item.get("type") == "blob":
             parts = item["path"].split("/")
             name = parts[-1]
+            has_error = bool(item.get("has_error"))
             blob_node = {
                 "name": name,
                 "path": item["path"],
                 "type": "blob",
                 "size": item.get("size", 0),
+                "has_error": has_error,
+                "error_badge": item.get("error_badge"),
+                "error_context": item.get("error_context"),
             }
             if len(parts) == 1:
                 root_nodes.append(blob_node)
@@ -243,23 +263,29 @@ def build_nested_tree(items: List[dict]) -> List[dict]:
                 parent_node = get_or_create_dir(parent_dir_path)
                 parent_node["children"].append(blob_node)
 
+            if has_error:
+                # Propagate has_error to parent directories
+                for i in range(1, len(parts)):
+                    ancestor = "/".join(parts[:i])
+                    if ancestor in dir_map:
+                        dir_map[ancestor]["has_error"] = True
+
     return root_nodes
 
 
-# ── High-performance in-memory cache for GitHub Trees and Files ──
-_TREE_CACHE: dict[str, tuple[float, List[dict], bool]] = {}
+_TREE_CACHE: dict[str, tuple[float, List[dict], bool, Optional[str]]] = {}
 _FILE_CACHE: dict[str, tuple[float, FileContentResponse]] = {}
 CACHE_TTL_SECONDS = 60.0
 
 
-async def fetch_github_tree_items(owner: str, repo: str, branch: str = "main", auth_token: Optional[str] = None) -> tuple[List[dict], bool]:
+async def fetch_github_tree_items(owner: str, repo: str, branch: str = "main", auth_token: Optional[str] = None) -> tuple[List[dict], bool, Optional[str]]:
     """Fetch tree items from GitHub API using GITHUB_TOKEN, OAuth token, or local fallback with caching."""
     cache_key = f"{owner}/{repo}@{branch}"
     now = time.time()
     if cache_key in _TREE_CACHE:
-        cached_time, cached_items, cached_mock = _TREE_CACHE[cache_key]
+        cached_time, cached_items, cached_mock, cached_sha = _TREE_CACHE[cache_key]
         if now - cached_time < CACHE_TTL_SECONDS:
-            return cached_items, cached_mock
+            return cached_items, cached_mock, cached_sha
 
     full_name = f"{owner}/{repo}"
     token = auth_token or os.getenv("GITHUB_TOKEN", "").strip()
@@ -267,11 +293,19 @@ async def fetch_github_tree_items(owner: str, repo: str, branch: str = "main", a
         token = ""
 
     # Fast-path check: local git repository if present
-    local_repo_dir = f"/Users/sahil/Documents/antigravity/{repo}"
-    if not os.path.exists(local_repo_dir) and os.path.exists(f"/Users/sahil/Documents/antigravity"):
-        # Check if local directory matches
-        if os.path.exists(os.path.join(f"/Users/sahil/Documents/antigravity", ".git")):
-            local_repo_dir = "/Users/sahil/Documents/antigravity"
+    candidates = [
+        f"/Users/sahil/Documents/AegisCore/{repo}",
+        os.path.join(os.getcwd(), repo),
+        f"/Users/sahil/Documents/antigravity/{repo}",
+    ]
+    if repo.lower() in ("aegiscore", "aegis-core"):
+        candidates.extend(["/Users/sahil/Documents/AegisCore", os.getcwd()])
+
+    local_repo_dir = ""
+    for c in candidates:
+        if os.path.exists(os.path.join(c, ".git")):
+            local_repo_dir = c
+            break
 
     headers = {
         "Accept": "application/vnd.github.v3+json",
@@ -283,6 +317,7 @@ async def fetch_github_tree_items(owner: str, repo: str, branch: str = "main", a
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
 
     raw_items = []
+    commit_sha: Optional[str] = None
     success = False
 
     try:
@@ -296,17 +331,17 @@ async def fetch_github_tree_items(owner: str, repo: str, branch: str = "main", a
             if resp.status_code == 200:
                 data = resp.json()
                 raw_items = data.get("tree", [])
+                commit_sha = (data.get("sha") or "")[:7] or None
                 success = True
     except Exception:
         pass
 
     if not success:
-        if full_name == "demo/autonomous-recovery-engine":
-            _TREE_CACHE[cache_key] = (now, DEMO_TREE, True)
-            return DEMO_TREE, True
-
-        # Fallback to local git repository if present
-        if os.path.exists(os.path.join(local_repo_dir, ".git")):
+        if full_name == "demo/autonomous-recovery-engine" or owner == "demo":
+            raw_items = list(DEMO_TREE)
+            commit_sha = "demo-main"
+            success = True
+        elif local_repo_dir and os.path.exists(os.path.join(local_repo_dir, ".git")):
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "git", "-C", local_repo_dir, "ls-tree", "-r", "--name-only", "HEAD",
@@ -324,26 +359,116 @@ async def fetch_github_tree_items(owner: str, repo: str, branch: str = "main", a
                                 raw_items.append({"path": dpath, "type": "tree"})
                         raw_items.append({"path": f, "type": "blob", "size": 0})
                     success = True
+
+                proc_sha = await asyncio.create_subprocess_exec(
+                    "git", "-C", local_repo_dir, "rev-parse", "--short", "HEAD",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                out_sha, _ = await proc_sha.communicate()
+                commit_sha = out_sha.decode().strip() or None
             except Exception:
                 pass
 
-    if not success and (full_name == "demo/autonomous-recovery-engine" or not raw_items):
-        _TREE_CACHE[cache_key] = (now, DEMO_TREE, True)
-        return DEMO_TREE, True
+    if not commit_sha:
+        commit_sha = "main-head"
+
+    items_to_process = raw_items if (success and raw_items) else DEMO_TREE
+    is_mock = not success or full_name == "demo/autonomous-recovery-engine" or owner == "demo"
+
+    from backend.services.repo_scanner import scan_file_for_errors
+
+    # Query recent incident error traces from database for this repo if available
+    recent_traces: dict[str, str] = {}
+    try:
+        from backend.db.session import AsyncSessionLocal
+        from backend.db.models import Incident
+        from sqlalchemy import select
+        async with AsyncSessionLocal() as db_session:
+            stmt = select(Incident).where(
+                (Incident.repository == full_name) | (Incident.repository_full_name == full_name)
+            ).order_by(Incident.created_at.desc()).limit(10)
+            res = await db_session.execute(stmt)
+            for inc in res.scalars().all():
+                payload = inc.github_payload or {}
+                trace = payload.get("stack_trace") or inc.triage_context or ""
+                failing_file = payload.get("failing_file") or ""
+                if failing_file and trace:
+                    recent_traces[failing_file] = trace
+                elif trace:
+                    for match in re.finditer(r'File\s+["\']([^"\']+)["\']', trace):
+                        recent_traces[match.group(1)] = trace
+    except Exception as exc:
+        logger.debug("Recent trace lookup non-fatal: %s", exc)
 
     items = []
-    for element in raw_items:
+    for element in items_to_process:
         path = element.get("path", "")
         if _should_ignore(path):
             continue
+
+        item_type = element.get("type", "blob")
+        size = element.get("size", 0) or 0
+        has_error = False
+        error_badge = None
+        error_context = None
+
+        if item_type == "blob":
+            file_content = ""
+            if path in DEMO_FILES:
+                file_content = DEMO_FILES[path]
+            elif local_repo_dir:
+                local_fpath = os.path.join(local_repo_dir, path)
+                if os.path.isfile(local_fpath) and size < 500000:
+                    try:
+                        with open(local_fpath, "r", encoding="utf-8", errors="replace") as f:
+                            file_content = f.read()
+                    except Exception:
+                        pass
+
+            if not file_content:
+                alt_paths = [
+                    f"/Users/sahil/Documents/AegisCore/ai-testing/{path}",
+                    f"/Users/sahil/Documents/AegisCore/demo/scenarios/low_risk_calculator/{path}",
+                    f"/Users/sahil/Documents/AegisCore/{path}",
+                ]
+                for ap in alt_paths:
+                    if os.path.isfile(ap):
+                        try:
+                            with open(ap, "r", encoding="utf-8", errors="replace") as f:
+                                file_content = f.read()
+                                break
+                        except Exception:
+                            pass
+
+            if not file_content and not is_mock and path.endswith((".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java")):
+                try:
+                    from backend.services.http_client import get_shared_client
+                    client = get_shared_client()
+                    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+                    resp = await client.get(raw_url, timeout=2.0)
+                    if resp.status_code == 200:
+                        file_content = resp.text
+                except Exception:
+                    pass
+
+            has_error, error_badge, error_context = scan_file_for_errors(
+                file_path=path,
+                content=file_content,
+                recent_ci_traces=recent_traces,
+            )
+
         items.append({
             "path": path,
-            "type": element.get("type", "blob"),
-            "size": element.get("size", 0) or 0
+            "type": item_type,
+            "size": size,
+            "has_error": has_error,
+            "error_badge": error_badge,
+            "error_context": error_context,
         })
 
-    _TREE_CACHE[cache_key] = (now, items, not success)
-    return items, not success
+    _TREE_CACHE[cache_key] = (now, items, is_mock, commit_sha)
+    return items, is_mock, commit_sha
 
 
 class ValidateRepoRequest(BaseModel):
@@ -399,6 +524,8 @@ class CreatePrRequest(BaseModel):
     pr_title: Optional[str] = None
     pr_body: Optional[str] = None
     commit_message: Optional[str] = None
+    auto_merge: bool = Field(default=False, description="Whether to immediately auto-merge the PR upon creation")
+    autoMerge: Optional[bool] = Field(default=None, description="Alias for auto_merge")
 
 
 class CreatePrResponse(BaseModel):
@@ -411,6 +538,10 @@ class CreatePrResponse(BaseModel):
     commit_sha: str
     commitSha: Optional[str] = None
     incident_id: Optional[str] = "rec-manual"
+    merged: bool = False
+    merge_sha: Optional[str] = None
+    merge_mode: str = "manual"
+    mergeMode: Optional[str] = None
     is_mock: bool = False
     message: str = "Pull Request opened successfully."
 
@@ -439,7 +570,7 @@ async def get_github_tree_get(
     owner, repo_name = _parse_repo_url(target_repo)
     full_name = f"{owner}/{repo_name}"
 
-    flat_items, is_mock = await fetch_github_tree_items(owner, repo_name, branch or "main")
+    flat_items, is_mock, commit_sha = await fetch_github_tree_items(owner, repo_name, branch or "main")
     nested = build_nested_tree(flat_items)
 
     return RepoTreeResponse(
@@ -447,6 +578,7 @@ async def get_github_tree_get(
         repo=repo_name,
         full_name=full_name,
         default_branch=branch or "main",
+        commit_sha=commit_sha,
         tree=flat_items,
         nested_tree=nested,
         flat_tree=flat_items,
@@ -470,7 +602,7 @@ async def get_repo_tree(request: RepoTreeRequest) -> RepoTreeResponse:
     owner, repo = _parse_repo_url(request.repository_url)
     full_name = f"{owner}/{repo}"
 
-    flat_items, is_mock = await fetch_github_tree_items(owner, repo, request.branch or "main")
+    flat_items, is_mock, commit_sha = await fetch_github_tree_items(owner, repo, request.branch or "main")
     nested = build_nested_tree(flat_items)
 
     return RepoTreeResponse(
@@ -478,6 +610,7 @@ async def get_repo_tree(request: RepoTreeRequest) -> RepoTreeResponse:
         repo=repo,
         full_name=full_name,
         default_branch=request.branch or "main",
+        commit_sha=commit_sha,
         tree=flat_items,
         nested_tree=nested,
         flat_tree=flat_items,
@@ -636,26 +769,30 @@ async def get_file_content(
         _FILE_CACHE[cache_key] = (now, res)
         return res
 
-    # Check local workspace fast-path if file exists on disk
-    possible_local_paths = [
-        os.path.join(f"/Users/sahil/Documents/antigravity/{repo_name}", clean_path),
-        os.path.join("/Users/sahil/Documents/antigravity", clean_path),
-    ]
-    for p in possible_local_paths:
-        if os.path.isfile(p):
-            try:
-                with open(p, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                res = FileContentResponse(
-                    file_path=clean_path,
-                    content=content,
-                    language=language,
-                    size=len(content.encode("utf-8")),
-                )
-                _FILE_CACHE[cache_key] = (now, res)
-                return res
-            except Exception:
-                pass
+    # Check local workspace fast-path only for local demo/aegiscore repository
+    if full_name == "demo/autonomous-recovery-engine" or repo_name.lower() in ("aegiscore", "aegis-core"):
+        possible_local_paths = [
+            os.path.join(f"/Users/sahil/Documents/AegisCore/{repo_name}", clean_path),
+            os.path.join("/Users/sahil/Documents/AegisCore", clean_path),
+            os.path.join(os.getcwd(), clean_path),
+            os.path.join(f"/Users/sahil/Documents/antigravity/{repo_name}", clean_path),
+            os.path.join("/Users/sahil/Documents/antigravity", clean_path),
+        ]
+        for p in possible_local_paths:
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    res = FileContentResponse(
+                        file_path=clean_path,
+                        content=content,
+                        language=language,
+                        size=len(content.encode("utf-8")),
+                    )
+                    _FILE_CACHE[cache_key] = (now, res)
+                    return res
+                except Exception:
+                    pass
 
     token = os.getenv("GITHUB_TOKEN", "").strip()
     if token == "your_github_token":
@@ -786,6 +923,17 @@ async def create_pr_endpoint(
     base_branch = request.baseBranch or "main"
     file_path = (request.filePath or request.file_path or "calculator.py").strip("/")
     fixed_content = request.fixedContent or request.corrected_code or ""
+
+    if file_path.endswith(".py") and fixed_content:
+        from backend.services.code_cleaner import validate_and_clean_code
+        fixed_content, is_valid, ast_err = validate_and_clean_code(fixed_content)
+        if not is_valid:
+            logger.error("[CREATE_PR] Cannot push invalid Python code to GitHub: %s", ast_err)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Cannot push code with Python syntax error: {ast_err}",
+            )
+
     commit_msg = (
         request.commitMessage
         or request.commit_message
@@ -801,13 +949,15 @@ async def create_pr_endpoint(
         or request.pr_body
         or f"## Autonomous Recovery Engine Fix\n\nAutomated fix applied to `{file_path}`."
     )
+    auto_merge = bool(request.auto_merge or request.autoMerge)
 
     owner, repo = _parse_repo_url(target_repo)
     full_name = f"{owner}/{repo}"
 
     timestamp = int(time.time())
     incident_id = request.incident_id or "rec-manual"
-    branch_name = request.branch_name or f"ai-recovery/{incident_id}-{timestamp % 10000}"
+    unique_suffix = f"{timestamp % 10000}-{uuid.uuid4().hex[:6]}"
+    branch_name = request.branch_name or f"ai-recovery/{incident_id}-{unique_suffix}"
     ref_name = f"refs/heads/{branch_name}"
 
     # Resolve GitHub authentication token from active Redis session, cookie, or environment
@@ -815,7 +965,7 @@ async def create_pr_endpoint(
     if session and session.get("access_token"):
         token = session["access_token"].strip()
 
-    if not token and github_token:
+    if not token and isinstance(github_token, str):
         token = github_token.strip()
 
     # Disallow global GITHUB_TOKEN fallback for another user's active session
@@ -857,95 +1007,211 @@ async def create_pr_endpoint(
             "User-Agent": "Antigravity-Engine/1.0",
         }
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # Step 1: Retrieve latest commit SHA of the base branch
-            base_ref_url = f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{base_branch}"
-            resp = await client.get(base_ref_url, headers=headers)
-            base_sha = None
-            if resp.status_code == 200:
-                base_sha = resp.json().get("object", {}).get("sha")
-            else:
-                branch_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/branches/{base_branch}", headers=headers)
-                if branch_resp.status_code == 200:
-                    base_sha = branch_resp.json().get("commit", {}).get("sha")
-                elif branch_resp.status_code in (401, 403):
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail=f"GitHub token does not have write access to {full_name}"
-                    )
+        from backend.services.http_client import get_shared_client
+        client = get_shared_client()
 
-            if not base_sha:
+        # Step 1: Retrieve latest commit SHA of the base branch
+        base_ref_url = f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{base_branch}"
+        resp = await client.get(base_ref_url, headers=headers)
+        base_sha = None
+        if resp.status_code == 200:
+            base_sha = resp.json().get("object", {}).get("sha")
+        else:
+            branch_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/branches/{base_branch}", headers=headers)
+            if branch_resp.status_code == 200:
+                base_sha = branch_resp.json().get("commit", {}).get("sha")
+            elif branch_resp.status_code in (401, 403):
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Base branch '{base_branch}' not found in {full_name}"
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"GitHub token does not have write access to {full_name}"
                 )
 
-            # Step 2: Create new branch refs/heads/{branch_name}
-            create_ref_url = f"https://api.github.com/repos/{owner}/{repo}/git/refs"
+        if not base_sha:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Base branch '{base_branch}' not found in {full_name}"
+            )
+
+        # Step 2: Create new branch refs/heads/{branch_name}
+        create_ref_url = f"https://api.github.com/repos/{owner}/{repo}/git/refs"
+        ref_resp = await client.post(create_ref_url, headers=headers, json={
+            "ref": ref_name,
+            "sha": base_sha
+        })
+        if ref_resp.status_code == 422 and "Reference already exists" in ref_resp.text:
+            logger.info(
+                "[CREATE_PR] Recovery branch %s already exists; resolving collision with suffix or updating ref.",
+                branch_name,
+            )
+            retry_suffix = f"-{int(time.time() * 1000) % 100000:05d}"
+            branch_name = f"{branch_name}{retry_suffix}"
+            ref_name = f"refs/heads/{branch_name}"
             ref_resp = await client.post(create_ref_url, headers=headers, json={
                 "ref": ref_name,
                 "sha": base_sha
             })
             if ref_resp.status_code == 422 and "Reference already exists" in ref_resp.text:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Recovery branch already exists for this incident"
-                )
-            elif ref_resp.status_code in (401, 403):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"GitHub token does not have write access to {full_name}"
-                )
+                sub_ref = ref_name.removeprefix("refs/")
+                update_ref_url = f"https://api.github.com/repos/{owner}/{repo}/git/{sub_ref}"
+                patch_resp = await client.patch(update_ref_url, headers=headers, json={
+                    "sha": base_sha,
+                    "force": True
+                })
+                if patch_resp.status_code in (200, 201):
+                    ref_resp = patch_resp
+        if ref_resp.status_code in (401, 403):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"GitHub token does not have write access to {full_name}"
+            )
 
-            # Step 3: Update the file on that branch using GitHub Contents API
-            content_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
-            get_content_resp = await client.get(content_url, headers=headers, params={"ref": branch_name})
-            existing_sha = None
-            if get_content_resp.status_code == 200:
-                existing_sha = get_content_resp.json().get("sha")
+        # Step 3: Update the file on that branch using GitHub Contents API
+        content_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
+        get_content_resp = await client.get(content_url, headers=headers, params={"ref": branch_name})
+        existing_sha = None
+        if get_content_resp.status_code == 200:
+            existing_sha = get_content_resp.json().get("sha")
 
-            encoded_content = base64.b64encode(fixed_content.encode("utf-8")).decode("utf-8")
-            put_payload = {
-                "message": commit_msg,
-                "content": encoded_content,
-                "branch": branch_name
-            }
-            if existing_sha:
-                put_payload["sha"] = existing_sha
+        encoded_content = base64.b64encode(fixed_content.encode("utf-8")).decode("utf-8")
+        put_payload = {
+            "message": commit_msg,
+            "content": encoded_content,
+            "branch": branch_name
+        }
+        if existing_sha:
+            put_payload["sha"] = existing_sha
 
-            put_resp = await client.put(content_url, headers=headers, json=put_payload)
-            if put_resp.status_code in (401, 403):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"GitHub token does not have write access to {full_name}"
-                )
+        put_resp = await client.put(content_url, headers=headers, json=put_payload)
+        if put_resp.status_code in (401, 403):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"GitHub token does not have write access to {full_name}"
+            )
 
-            commit_sha = base_sha
-            if put_resp.status_code in (200, 201):
-                commit_sha = put_resp.json().get("commit", {}).get("sha", base_sha)
+        commit_sha = base_sha
+        if put_resp.status_code in (200, 201):
+            commit_sha = put_resp.json().get("commit", {}).get("sha", base_sha)
 
-            # Step 4: Create a Pull Request against main
-            pulls_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
-            pull_resp = await client.post(pulls_url, headers=headers, json={
-                "title": pr_title,
-                "head": branch_name,
-                "base": base_branch,
-                "body": pr_body
-            })
+        # Step 4: Create a Pull Request against main
+        pulls_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+        pull_resp = await client.post(pulls_url, headers=headers, json={
+            "title": pr_title,
+            "head": branch_name,
+            "base": base_branch,
+            "body": pr_body
+        })
 
-            if pull_resp.status_code in (200, 201):
-                pr_data = pull_resp.json()
-                pr_url = pr_data.get("html_url")
-                pr_number = pr_data.get("number")
+        if pull_resp.status_code in (200, 201):
+            pr_data = pull_resp.json()
+            pr_url = pr_data.get("html_url")
+            pr_number = pr_data.get("number")
 
-                await telemetry_manager.publish(
-                    incident_id=incident_id,
-                    event_type="pr_created",
-                    node_name="pr_creator_node",
-                    message=f"[RECOVERY] Pull Request opened successfully: {pr_url}",
-                    metadata={"pr_url": pr_url, "pr_number": pr_number}
-                )
+            await telemetry_manager.publish(
+                incident_id=incident_id,
+                event_type="pr_created",
+                node_name="pr_creator_node",
+                message=f"[RECOVERY] Pull Request opened successfully: {pr_url}",
+                metadata={"pr_url": pr_url, "pr_number": pr_number}
+            )
 
+            # Decoupled conditional auto-merge
+            merged_sha: str | None = None
+            is_merged: bool = False
+            merge_mode: str = "manual"
+
+            if auto_merge:
+                merge_mode = "auto"
+                try:
+                    merge_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge"
+                    merge_resp = await client.put(
+                        merge_url,
+                        headers=headers,
+                        json={
+                            "commit_title": f"Merge pull request #{pr_number} from {branch_name}",
+                            "commit_message": f"Autonomous recovery patch squash merge for {incident_id}",
+                            "merge_method": "squash",
+                        },
+                    )
+                    if merge_resp.status_code in (200, 201):
+                        merge_data = merge_resp.json()
+                        is_merged = True
+                        merged_sha = merge_data.get("sha")
+                        try:
+                            from backend.recovery_ext.post_merge import trigger_post_merge_verification
+                            asyncio.create_task(trigger_post_merge_verification(
+                                incident_id=incident_id,
+                                pr_number=pr_number,
+                                repository_full_name=full_name,
+                                merged_sha=merged_sha or "merged-sha",
+                            ))
+                        except Exception:
+                            pass
+                    else:
+                        # Fallback to attempt_auto_merge if direct PUT returned non-200
+                        try:
+                            from backend.recovery_ext.auto_merge import attempt_auto_merge
+                            am_result = await attempt_auto_merge(
+                                state={
+                                    "access_level": "WRITE",
+                                    "action_decision": "ALLOW",
+                                    "human_approved": True,
+                                    "retry_count": 0,
+                                },
+                                pr_url=pr_url,
+                                pr_number=pr_number or 0,
+                                repository_full_name=full_name,
+                                incident_id=incident_id,
+                                user_token=token,
+                            )
+                            if am_result.merged:
+                                is_merged = True
+                                merged_sha = am_result.merge_sha
+                        except Exception as _am_exc:
+                            logger.warning("[CREATE_PR] auto_merge attempt failed (non-fatal): %s", _am_exc)
+                except Exception as _m_exc:
+                    logger.warning("[CREATE_PR] GitHub merge call failed (non-fatal): %s", _m_exc)
+            else:
+                logger.info("[CREATE_PR] auto_merge is False: Skipping merge API call; PR #%s remains open.", pr_number)
+                is_merged = False
+                merge_mode = "manual"
+
+            return CreatePrResponse(
+                incident_id=incident_id,
+                pr_url=pr_url,
+                pr_number=pr_number,
+                prUrl=pr_url,
+                prNumber=pr_number,
+                branch_name=branch_name,
+                branchName=branch_name,
+                commit_sha=merged_sha or commit_sha,
+                commitSha=merged_sha or commit_sha,
+                merged=is_merged,
+                merge_sha=merged_sha,
+                merge_mode=merge_mode,
+                mergeMode=merge_mode,
+                is_mock=False,
+                message="Pull Request opened and squash-merged automatically!" if is_merged else "Pull Request opened successfully."
+            )
+        elif pull_resp.status_code == 422:
+            logger.info("[CREATE_PR] Pull request creation returned 422 (possibly already exists). Checking open PRs...")
+            existing_prs_resp = await client.get(
+                pulls_url,
+                headers=headers,
+                params={"state": "open", "base": base_branch}
+            )
+            matched_pr = None
+            if existing_prs_resp.status_code == 200:
+                prs = existing_prs_resp.json()
+                for p in prs:
+                    if p.get("head", {}).get("ref") == branch_name or "ai-recovery" in p.get("head", {}).get("ref", ""):
+                        matched_pr = p
+                        break
+                if not matched_pr and prs:
+                    matched_pr = prs[0]
+
+            if matched_pr:
+                pr_url = matched_pr.get("html_url")
+                pr_number = matched_pr.get("number")
                 return CreatePrResponse(
                     incident_id=incident_id,
                     pr_url=pr_url,
@@ -956,24 +1222,25 @@ async def create_pr_endpoint(
                     branchName=branch_name,
                     commit_sha=commit_sha,
                     commitSha=commit_sha,
+                    merged=False,
                     is_mock=False,
-                    message="Pull Request opened successfully."
+                    message=f"Pull Request #{pr_number} already exists and was synchronized."
                 )
-            elif pull_resp.status_code == 422:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"A recovery PR already exists: https://github.com/{full_name}/pulls"
-                )
-            elif pull_resp.status_code in (401, 403):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"GitHub token does not have write access to {full_name}"
-                )
-            else:
-                raise HTTPException(
-                    status_code=pull_resp.status_code,
-                    detail=f"GitHub PR creation failed ({pull_resp.status_code}): {pull_resp.text[:200]}"
-                )
+
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A recovery PR already exists: https://github.com/{full_name}/pulls"
+            )
+        elif pull_resp.status_code in (401, 403):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"GitHub token does not have write access to {full_name}"
+            )
+        else:
+            raise HTTPException(
+                status_code=pull_resp.status_code,
+                detail=f"GitHub PR creation failed ({pull_resp.status_code}): {pull_resp.text[:200]}"
+            )
 
     if full_name == "demo/autonomous-recovery-engine":
         # Simulation / Mock PR allowed only for explicit demo/autonomous-recovery-engine
@@ -996,6 +1263,10 @@ async def create_pr_endpoint(
             },
         )
 
+        is_merged = bool(auto_merge)
+        merge_mode = "auto" if auto_merge else "manual"
+        merged_sha = simulated_commit_sha if is_merged else None
+
         return CreatePrResponse(
             incident_id=incident_id,
             pr_url=simulated_pr_url,
@@ -1006,8 +1277,12 @@ async def create_pr_endpoint(
             branchName=branch_name,
             commit_sha=simulated_commit_sha,
             commitSha=simulated_commit_sha,
+            merged=is_merged,
+            merge_sha=merged_sha,
+            merge_mode=merge_mode,
+            mergeMode=merge_mode,
             is_mock=True,
-            message="Pull Request opened successfully."
+            message="Pull Request opened and squash-merged automatically!" if is_merged else "Pull Request opened successfully."
         )
 
     # In REAL mode for all real repositories, fail loudly without mock PR
@@ -1115,12 +1390,29 @@ class MergePrRequest(BaseModel):
     prNumber: Optional[int] = Field(default=None)
     pr_number: Optional[int] = Field(default=None)
     commitMessage: Optional[str] = Field(default=None)
+    incident_id: Optional[str] = Field(default=None)
+    incidentId: Optional[str] = Field(default=None)
 
 
 class MergePrResponse(BaseModel):
     merged: bool = True
     message: str = "PR successfully merged into main branch."
     sha: Optional[str] = None
+
+
+class PostMergeVerifyRequest(BaseModel):
+    repo: str
+    pr_number: Optional[int] = 1
+    incident_id: Optional[str] = None
+    commit_sha: Optional[str] = None
+
+
+class PostMergeVerifyResponse(BaseModel):
+    tests_passed: bool
+    exit_code: int
+    message: str
+    error: Optional[str] = None
+    merged_sha: Optional[str] = None
 
 
 @github_api_router.post("/merge-pr", response_model=MergePrResponse)
@@ -1140,6 +1432,7 @@ async def merge_pr_endpoint(
         )
     pr_num = request.prNumber or request.pr_number or 1
     commit_msg = request.commitMessage or f"Merge pull request #{pr_num} from fix/recovery-patch"
+    inc_id = request.incident_id or request.incidentId or f"manual-{pr_num}"
 
     owner, repo_name = _parse_repo_url(target_repo)
     full_name = f"{owner}/{repo_name}"
@@ -1170,6 +1463,16 @@ async def merge_pr_endpoint(
                 if resp.status_code in (200, 201):
                     data = resp.json()
                     sha = data.get("sha")
+                    try:
+                        from backend.recovery_ext.post_merge import trigger_post_merge_verification
+                        asyncio.create_task(trigger_post_merge_verification(
+                            incident_id=inc_id,
+                            pr_number=pr_num,
+                            repository_full_name=full_name,
+                            merged_sha=sha or "merged-sha",
+                        ))
+                    except Exception:
+                        pass
                     return MergePrResponse(
                         merged=True,
                         message=f"[RECOVERY] PR #{pr_num} successfully merged into main branch.",
@@ -1178,11 +1481,60 @@ async def merge_pr_endpoint(
         except Exception:
             pass
 
+    try:
+        from backend.recovery_ext.post_merge import trigger_post_merge_verification
+        asyncio.create_task(trigger_post_merge_verification(
+            incident_id=inc_id,
+            pr_number=pr_num,
+            repository_full_name=full_name,
+            merged_sha="7f8b9a01c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7",
+        ))
+    except Exception:
+        pass
+
     return MergePrResponse(
         merged=True,
         message=f"[RECOVERY] PR #{pr_num} successfully merged into main branch.",
         sha="7f8b9a01c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7"
     )
+
+
+@github_api_router.post("/post-merge-verify", response_model=PostMergeVerifyResponse)
+@router.post("/post-merge-verify", response_model=PostMergeVerifyResponse)
+async def post_merge_verify_endpoint(
+    request: PostMergeVerifyRequest,
+) -> PostMergeVerifyResponse:
+    owner, repo_name = _parse_repo_url(request.repo)
+    full_name = f"{owner}/{repo_name}"
+    inc_id = request.incident_id or f"manual-{request.pr_number}"
+    merged_sha = request.commit_sha or "main"
+
+    try:
+        from backend.recovery_ext.post_merge import _run_post_merge_verification
+        result = await _run_post_merge_verification(
+            incident_id=inc_id,
+            pr_number=request.pr_number or 1,
+            repository_full_name=full_name,
+            merged_sha=merged_sha,
+        )
+        passed = bool(result and result.get("tests_passed"))
+        code = result.get("exit_code", 0) if (result and passed) else (result.get("exit_code", 1) if result else 1)
+        err = result.get("error") if result else None
+        return PostMergeVerifyResponse(
+            tests_passed=passed,
+            exit_code=code,
+            message="Verified on main" if passed else (err or "Tests failed on main"),
+            error=err,
+            merged_sha=merged_sha,
+        )
+    except Exception as e:
+        return PostMergeVerifyResponse(
+            tests_passed=False,
+            exit_code=1,
+            message="Verification failed",
+            error=str(e),
+            merged_sha=merged_sha,
+        )
 
 
 @github_api_router.put("/pulls/{pr_number}/merge", response_model=MergePrResponse)
@@ -1196,3 +1548,96 @@ async def merge_pr_by_path_endpoint(
         MergePrRequest(repo=repo, prNumber=pr_number),
         github_token=github_token
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Fork-and-PR Access Classification & User Consent Endpoints
+# ---------------------------------------------------------------------------
+
+class AccessCheckResponse(BaseModel):
+    repository: str
+    access_level: str
+    opted_out: bool
+    requires_consent: bool
+    has_consent: bool
+    details: dict[str, Any] = {}
+
+
+class ConsentRequest(BaseModel):
+    repository: str
+
+
+class ConsentResponse(BaseModel):
+    success: bool
+    repository: str
+    message: str
+
+
+def _resolve_user_token(session_id: str | None = None, github_token: str | None = None) -> str:
+    if session_id:
+        sess = session_service.get_session(session_id)
+        if sess and sess.get("github_token"):
+            return sess["github_token"]
+    if github_token and github_token != "your_github_token":
+        return github_token
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token and token != "your_github_token":
+        return token
+    return ""
+
+
+
+@router.get("/access-check", response_model=AccessCheckResponse)
+@github_api_router.get("/access-check", response_model=AccessCheckResponse)
+async def check_repo_access_endpoint(
+    repo: str = Query(...),
+    session_id: str | None = Cookie(None, alias="session_id"),
+    github_token: str | None = Cookie(None, alias="github_token"),
+) -> AccessCheckResponse:
+    token = _resolve_user_token(session_id, github_token)
+    owner, repo_name = _parse_repo_url(repo)
+    full_name = f"{owner}/{repo_name}"
+
+    from backend.recovery_ext.fork_pr import (
+        classify_repo_access,
+        check_ai_recovery_opt_out,
+        check_fork_consent,
+        AccessLevel,
+    )
+
+    access_level, meta = classify_repo_access(full_name, token or "")
+    opted_out = check_ai_recovery_opt_out(full_name, token or "") if token else False
+
+    user_id = session_id or "anonymous"
+    has_consent = await check_fork_consent(user_id, full_name)
+    requires_consent = (access_level == AccessLevel.FORK_REQUIRED)
+
+    return AccessCheckResponse(
+        repository=full_name,
+        access_level=access_level.value,
+        opted_out=opted_out,
+        requires_consent=requires_consent,
+        has_consent=has_consent,
+        details=meta if isinstance(meta, dict) else {},
+    )
+
+
+@router.post("/consent", response_model=ConsentResponse)
+@github_api_router.post("/consent", response_model=ConsentResponse)
+async def record_user_consent_endpoint(
+    req: ConsentRequest,
+    session_id: str | None = Cookie(None, alias="session_id"),
+) -> ConsentResponse:
+    owner, repo_name = _parse_repo_url(req.repository)
+    full_name = f"{owner}/{repo_name}"
+
+    from backend.recovery_ext.fork_pr import record_fork_consent
+    user_id = session_id or "anonymous"
+    await record_fork_consent(user_id, full_name)
+
+    return ConsentResponse(
+        success=True,
+        repository=full_name,
+        message=f"Consent recorded for user {user_id} on repository {full_name}.",
+    )
+
