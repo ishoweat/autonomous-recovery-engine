@@ -67,3 +67,4 @@ recovery*.db*
 scratch.py
 scratch_gh.py
 scratch_test_*.py
+ai-testing/
