@@ -9,6 +9,28 @@ export const API_BASE_URL = (
   "http://localhost:8000"
 ).replace(/\/$/, "");
 
+if (typeof window !== "undefined") {
+  const originalFetch = window.fetch;
+  window.fetch = async (input, init) => {
+    const urlStr =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+        ? input.toString()
+        : (input as Request).url;
+    if (urlStr && urlStr.includes("ngrok")) {
+      const headers = new Headers(
+        init?.headers || (input instanceof Request ? input.headers : undefined)
+      );
+      if (!headers.has("ngrok-skip-browser-warning")) {
+        headers.set("ngrok-skip-browser-warning", "true");
+      }
+      return originalFetch(input, { ...init, headers });
+    }
+    return originalFetch(input, init);
+  };
+}
+
 export interface ApprovalResponse {
   incident_id: string;
   approved: boolean;
@@ -97,9 +119,10 @@ export async function approveIncident(
 export function incidentStreamUrl(
   incidentId: string
 ): string {
-  return `${API_BASE_URL}/api/v1/incident/${encodeURIComponent(
+  const url = `${API_BASE_URL}/api/v1/incident/${encodeURIComponent(
     incidentId
   )}/stream`;
+  return url.includes("ngrok") ? `${url}?ngrok-skip-browser-warning=true` : url;
 }
 
 export async function submitGithubWebhook(
